@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pymupdf as fitz
 from PIL import Image, ImageDraw
+from deteccion_visual import regiones_visuales
 from reglas import VERSION, TIPOS, aplicar
 
 def sha(data):
@@ -62,6 +63,19 @@ class Sesion:
                 item["review_id"] = len(self.detecciones)
                 self.propuestas_b[item["review_id"]] = dict(copy.deepcopy(d), id_deteccion=item["id_deteccion"])
                 self.detecciones.append(item)
+        for image,meta in zip(self.imagenes,self.paginas):
+            personas = [d for d in self.detecciones if d["page"]==meta["page_number"] and d["category"].startswith("persona")]
+            for category,polygon,basis,caption in regiones_visuales(image,meta,personas):
+                index = len(self.detecciones)
+                xs,ys = zip(*polygon)
+                item = aplicar(dict(page=meta["page_number"], source_file=self.original.name,
+                                    category=category, classification_basis=basis, flags=[], sources=["vision"],
+                                    id_deteccion=f"V{index+1:07d}", review_id=index, text=caption or category,
+                                    fragment_text=caption or category, bbox_xyxy=[min(xs),min(ys),max(xs),max(ys)],
+                                    polygons=[polygon], location_precision=("qr_poligono" if category=="qr" else "firma_localizada" if basis.endswith("_confirmada") else "region_visual"),
+                                    dpi=meta["render_dpi"]))
+                self.detecciones.append(item)
+                self.propuestas_b[index] = item.copy()
         self.segundos_carga_c = perf_counter() - inicio_carga
 
     def clasificar(self, tipo):
@@ -193,6 +207,9 @@ class Sesion:
         poligonos = deteccion.get("polygons")
         self._poligonos(pagina, poligonos)
 
+        if deteccion.get("location_precision") in {"qr_poligono","firma_localizada"}:
+            return poligonos
+
         def limites(puntos):
             xs, ys = zip(*puntos)
             return (math.floor(min(xs)), math.floor(min(ys)),
@@ -211,7 +228,6 @@ class Sesion:
         # B entrega un fragmento por línea. Una franja cubre sus cajas y los espacios entre ellas.
         x0, y0, x1, y1 = limites(p for poligono in poligonos for p in poligono)
         ancho, alto = self.imagenes[pagina - 1].size
-        base = (x0, y0, min(ancho - 1, x1), min(alto - 1, y1))
         margen = max(1, round((y1 - y0) * 0.12))
         franja = [max(0, x0 - margen), max(0, y0 - margen),
                   min(ancho - 1, x1 + margen), min(alto - 1, y1 + margen)]
@@ -223,7 +239,7 @@ class Sesion:
         if cajas and len(cajas) == len(texto):
             vecinos = [(i, i + 1, tuple(caja)) for i, caja in enumerate(cajas) if caja]
         else:
-            vecinos = [(p["start"], p["end"], limites(p["polygon"]))
+            vecinos = [(p["start"], p["end"], p["polygon"])
                        for p in linea.get("words", []) if p.get("polygon")]
         fuera = {i for i, caracter in enumerate(texto)
                  if not caracter.isspace() and not inicio <= i < fin}
@@ -266,7 +282,7 @@ class Sesion:
                     if max(pa)<min(pb) or max(pb)<min(pa): return False
             return True
 
-        otros = [rect(c) for c in protegidos]
+        otros = [rect(c) if isinstance(c[0], (int, float)) else hull(c) for c in protegidos]
         for otro, otra in lineas.items():
             if otro==indice: continue
             poly=otra.get("polygon")
@@ -280,13 +296,16 @@ class Sesion:
             otros.append(h)
             otros.extend(hull(w["polygon"]) for w in otra.get("words",[]) if w.get("polygon"))
         otros=[p for p in otros if len(p)>=3 and cruza(limites(p),franja)]
-        if any(intersect(rect(base),p) for p in otros):
+        base = hull(p for poligono in poligonos for p in poligono)
+        if len(base) < 3 or any(intersect(base,p) for p in otros):
             raise ValueError("La franja invadiría texto vecino (polígono)")
         # Probar márgenes decrecientes sin reducir la superficie del dato.
         for m in range(margen,-1,-1):
-            candidate=(max(0,x0-m),max(0,y0-m),min(ancho-1,x1+m),min(alto-1,y1+m))
-            if not any(intersect(rect(candidate),p) for p in otros):
-                return [rect(candidate)]
+            # Dilatar el contorno en píxeles conservando la orientación.
+            candidate = hull((min(ancho-1, max(0, x+dx)), min(alto-1, max(0, y+dy)))
+                             for x,y in base for dx in (-m,m) for dy in (-m,m))
+            if not any(intersect(candidate,p) for p in otros):
+                return [candidate]
         raise ValueError("No se pudo generar una franja segura")
 
     def exportar_automatico(self, destino, *, recuadros_pendientes=True):
@@ -388,6 +407,23 @@ class Sesion:
         with fitz.open(stream=data, filetype="pdf") as check:
             if check.embfile_count() or any(p.get_text().strip() or p.get_links() or list(p.annots() or []) for p in check):
                 raise ValueError("El PDF no superó la comprobación estructural")
+            # Verificar los píxeles del QR en la imagen incrustada en el PDF final.
+            for i,page in enumerate(check,1):
+                accepted = [d for d in self.detecciones if d["page"]==i and d["category"]=="qr" and d["decision"]=="aceptar"]
+                if not accepted:
+                    continue
+                images = page.get_images(full=True)
+                if len(images)!=1:
+                    raise ValueError("No se pudo verificar la imagen del QR")
+                with Image.open(io.BytesIO(check.extract_image(images[0][0])["image"])) as exported:
+                    mask = Image.new("1",exported.size)
+                    draw = ImageDraw.Draw(mask)
+                    for d in accepted:
+                        original = self.propuestas_b.get(d["review_id"],d)
+                        for poly in original.get("polygons",d["polygons"]):
+                            draw.polygon([tuple(p) for p in poly],fill=1)
+                    if Image.composite(exported.convert("RGB"),Image.new("RGB",exported.size),mask).getbbox():
+                        raise ValueError("Píxeles de QR sin cubrir en el PDF exportado")
         tiempos_b = {(t["archivo"], t["pagina"]): t["segundos_analisis_b"]
                      for t in self.datos.get("rendimiento", {}).get("paginas", [])}
         def filas():

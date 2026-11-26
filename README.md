@@ -12,6 +12,8 @@ Procesa copias escaneadas de actos administrativos chilenos y genera PDF de revi
 | `reglas.py` | Define categorías y reglas compartidas por la detección y la revisión. |
 | `tarjar_lote.py` | Ejecuta A → B → C por PDF y muestra el tiempo total y el promedio por página completada. |
 
+La V5 corrige la inclinación en la imagen de análisis cuando hay evidencia suficiente y devuelve las coordenadas al render original. En tablas usa las celdas disponibles y la proximidad entre rótulo y valor. OpenCV localiza códigos QR. La etapa C comprueba los píxeles cubiertos en el PDF exportado. Las demás regiones visuales se proponen para revisión según su geometría y los rótulos próximos. Para repetir las regresiones, ejecuta `python -m unittest -v test_v5`.
+
 El modo automático une las cajas de cada dato por línea y reduce el margen cerca del texto vecino. Las zonas ambiguas quedan visibles y anotadas en un registro privado. La detección de firmas, fotos, huellas y datos de menores requiere revisión. La clasificación del titular de un RUT también requiere revisión.
 
 ## Instalación en Windows

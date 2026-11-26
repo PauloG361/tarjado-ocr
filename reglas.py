@@ -1,7 +1,7 @@
 """Política de propuestas de tarjado. Única fuente de decisiones, no aprobación."""
 import re
 
-VERSION = "2026-11-26.4"
+VERSION = "2026-11-26.5"
 TIPOS = ("sin_clasificar", "destinacion_ffaa", "arriendo", "titulo_gratuito", "saneamiento", "otro")
 REGLAS = {
     "identificador_administrativo": ["RNA-14", "RNA-15"],
@@ -22,10 +22,12 @@ REGLAS = {
     "dato_menor": ["RNA-07"], "dato_menor_revisar": ["RNA-07"],
     "ubicacion_inmueble_revisar": ["RNA-09", "RNA-14"],
     "plano": ["RNA-09"], "deslindes": ["RNA-09"],
+    "profesion_revisar": ["RNA-13"], "garantia_revisar": ["RNA-13"], "monto_adeudado_revisar": ["RNA-13"],
     "recinto": ["RNA-10"], "dato_pendiente": ["RNA-13"],
     "codigo_validacion": ["RNA-11", "RNA-24"],
     "codigo_validacion_revisar": ["RNA-11", "RNA-24"],
     "vinculo_validacion": ["RNA-24"], "qr": ["RNA-11", "RNA-24"],
+    "timbre": ["RNA-14"], "imagen": ["RNA-05", "RNA-14"],
     "firma": ["RNA-05", "RNA-14"], "fotografia": ["RNA-05"], "huella": ["RNA-05"],
     "dato_salud": ["RNA-05", "RNA-07"], "dato_salud_personal": ["RNA-05", "RNA-07"],
 }
@@ -38,8 +40,13 @@ _CONFLICTOS = {"conflicto_contextual_documental", "revisar_contexto_repeticion",
 
 def politica(categoria, tipo="sin_clasificar", *, base="", flags=()):
     """La categoría y su evidencia deciden; nunca el score de GLiNER por sí solo."""
+    if base in {"qr_sin_finalidad","region_visual_por_confirmar","firma_particular_propuesta","firma_institucional_propuesta"}:
+        return "revisar"
     if base in _CONFLICTOS or "conflicto_solapamiento" in flags:
         return "revisar"
+    if categoria=="firma":
+        if base=="firma_particular_confirmada": return "si"
+        if base=="firma_institucional_confirmada": return "no"
     if categoria in _SI:
         return "si"
     if categoria in _NO or categoria.startswith("ignorar:"):
@@ -61,7 +68,7 @@ def aplicar(deteccion, tipo="sin_clasificar"):
         reglas = list(dict.fromkeys(reglas + ["RNA-12"]))
     d.update(rule_ids=reglas, rules_version=VERSION, decision="pendiente",
              tarjar=politica(cat, tipo, base=d.get("classification_basis", ""), flags=d.get("flags") or []))
-    if d.get("location_precision") not in {"word_polygons", "character_boxes_union", "manual"}:
+    if d.get("location_precision") not in {"word_polygons", "character_boxes_union", "qr_poligono", "firma_localizada", "manual"}:
         d["requires_geometry_review"] = True
     return d
 
@@ -70,7 +77,9 @@ def candidatos_adicionales(text):
     patrones = {
         "plano": r"\bplano\s+(?:(?:n[°ºo.]|n[uú]mero)\s*)?[:：]?\s*([\w./-]*\d[\w./-]*)",
         "codigo_validacion": r"\bc[oó]digo\s+(?:de\s+)?(?:validaci[oó]n|verificaci[oó]n)\s*[:：]?\s*([\w-]+)",
-        "dato_pendiente": r"\b(?:profesi[oó]n|(?:n[uú]mero\s+de\s+)?garant[ií]a|monto\s+adeudado)\s*[:：]?\s*([^\n;,]{1,70})",
+        "profesion_revisar": r"\bprofesi[oó]n\s*[:：]?\s*([^\n;,.]{1,70})",
+        "garantia_revisar": r"\b(?:n[uú]mero\s+de\s+)?garant[ií]a\s*[:：]?\s*([^\n;,.]{1,70})",
+        "monto_adeudado_revisar": r"\bmonto\s+adeudado\s*[:：]?\s*(\$?\s*\d[\d.,]*)",
     }
     for cat, patron in patrones.items():
         for m in re.finditer(patron, text, re.I):

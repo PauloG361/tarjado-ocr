@@ -254,17 +254,70 @@ def normalise_ocr_result(result_obj):
         })
     return lines, data
 
+def preparar_analisis(rgb):
+    """Estima el ángulo solo si varias líneas largas concuerdan."""
+    h,w = rgb.shape[:2]
+    scale = min(1., 1200/max(h,w))
+    small = cv2.resize(rgb, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    gray = cv2.cvtColor(small,cv2.COLOR_RGB2GRAY)
+    ink = cv2.threshold(gray,0,255,cv2.THRESH_BINARY_INV+cv2.THRESH_OTSU)[1]
+    joined = cv2.morphologyEx(ink,cv2.MORPH_CLOSE,np.ones((1, max(7, small.shape[1]//65)),np.uint8))
+    contours,_ = cv2.findContours(joined,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+    angles = []
+    for contour in contours:
+        corners = cv2.boxPoints(cv2.minAreaRect(contour))
+        sides = np.roll(corners,-1,axis=0)-corners
+        lengths = np.linalg.norm(sides,axis=1)
+        if min(lengths)<2 or max(lengths)<max(35,small.shape[1]*.055) or max(lengths)<5*min(lengths):
+            continue
+        dx,dy = sides[int(np.argmax(lengths))]
+        angle = (np.degrees(np.arctan2(dy,dx))+90)%180-90
+        if abs(angle)<=12:
+            angles.append(angle)
+    if len(angles)<4:
+        return rgb,None
+    angle = float(np.median(angles))
+    if abs(angle)<.6 or np.mean(np.abs(np.asarray(angles)-angle)<1.2)<.75:
+        return rgb,None
+    matrix = cv2.getRotationMatrix2D((w/2,h/2),angle,1)
+    width = int(np.ceil(abs(matrix[0,0])*w+abs(matrix[0,1])*h))
+    height = int(np.ceil(abs(matrix[0,1])*w+abs(matrix[0,0])*h))
+    matrix[:,2] += [(width-w)/2,(height-h)/2]
+    image = cv2.warpAffine(rgb,matrix,(width,height),borderValue=(255,255,255))
+    return image,cv2.invertAffineTransform(matrix)
+
+
+def restaurar_geometria(lines, inverse):
+    def project(poly):
+        return (np.asarray(poly) @ inverse[:,:2].T + inverse[:,2]).tolist()
+    for line in lines:
+        line["polygon"] = project(line["polygon"])
+        line["bbox_xyxy"] = poly_bbox(line["polygon"])
+        line["center_xy"] = poly_center(line["polygon"])
+        if line.get("char_boxes_xyxy"):
+            line["char_boxes_xyxy"] = [poly_bbox(project(rect_polygon(box))) if box else None
+                                       for box in line["char_boxes_xyxy"]]
+        for word in line["words"]:
+            if word["polygon"]:
+                word["polygon"] = project(word["polygon"])
+                word["bbox_xyxy"] = poly_bbox(word["polygon"])
+
+
 def run_pipelines(page_record):
     rgb = np.asarray(page_record["image"].convert("RGB"))
 
+    analysis,inverse = preparar_analisis(rgb)
+    page_record["analysis_to_render"] = inverse.tolist() if inverse is not None else None
     numero = page_record["page_number"]
     progreso = page_record.get("progress_path")
-    ocr_results = ejecutar_etapa(f"Página {numero} / reconocimiento de texto", lambda: list(ocr.predict(rgb)), progreso)
+    ocr_results = ejecutar_etapa(f"Página {numero} / reconocimiento de texto", lambda: list(ocr.predict(analysis)), progreso)
     if not ocr_results:
         ocr_lines, ocr_raw = [], {}
     else:
         ocr_lines, ocr_raw = normalise_ocr_result(ocr_results[0])
 
+    if inverse is not None:
+        restaurar_geometria(ocr_lines,inverse)
     page_record.update(ocr_lines=ocr_lines, ocr_raw=ocr_raw)
     if page_record.get("checkpoint_dir"):
         ruta = Path(page_record["checkpoint_dir"]) / f"pagina_{numero:04d}_ocr.json"
@@ -450,32 +503,20 @@ def procesar(entrada, salida, dpi=220, device="cpu"):
         device=DEVICE,
     ), salida / "progreso.json")
 
-    # Se intenta desactivar submódulos no necesarios para el diagnóstico de layout.
-    # Si una compilación concreta no acepta alguno de estos argumentos, se usa
-    # la inicialización mínima documentada y se informa la excepción.
+    options = dict(device=DEVICE,use_doc_orientation_classify=False,use_doc_unwarping=False,
+                   use_textline_orientation=False,enable_mkldnn=False)
     try:
-        structure = ejecutar_etapa("Carga de PP-StructureV3", lambda: PPStructureV3(
-            device=DEVICE,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            use_table_recognition=False,
-            use_formula_recognition=False,
-            use_seal_recognition=False,
-            enable_mkldnn=False,
+        structure = ejecutar_etapa("Carga de PP-StructureV3 con celdas", lambda: PPStructureV3(
+            **options,use_table_recognition=True,use_formula_recognition=False,use_seal_recognition=False
         ), salida / "progreso.json")
-        print("PP-StructureV3 inicializado con módulos opcionales desactivados.")
     except TypeError as exc:
-        print("Constructor extendido no aceptado; intento constructor básico:", exc)
-        structure = ejecutar_etapa("Carga básica de PP-StructureV3", lambda: PPStructureV3(
-            device=DEVICE,
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False,
-            enable_mkldnn=False,
-        ), salida / "progreso.json")
-        print("PP-StructureV3 inicializado con configuración básica.")
-
+        print("Constructor extendido incompatible, usando configuración básica:", exc,flush=True)
+        structure = ejecutar_etapa("Carga básica de PP-StructureV3",lambda: PPStructureV3(**options),salida / "progreso.json")
+    except (OSError,RuntimeError,ValueError) as exc:
+        print("Estructura de celdas no disponible, usando emparejamiento geométrico:",exc,flush=True)
+        structure = ejecutar_etapa("Carga de layout sin modelos de tabla",lambda: PPStructureV3(
+            **options,use_table_recognition=False,use_formula_recognition=False,use_seal_recognition=False
+        ),salida / "progreso.json")
 
     all_pages = ejecutar_etapa("Renderizado del PDF", lambda: load_pages(entrada, dpi=dpi), salida / "progreso.json")
     for page in all_pages:
@@ -524,6 +565,9 @@ def procesar(entrada, salida, dpi=220, device="cpu"):
             "render_sha256": page["render_sha256"],
             "pdf_page_rect_points": page["pdf_page_rect_points"],
             "coordinate_system": "rendered_page_pixels_top_left_origin",
+            "analysis_to_render": page.get("analysis_to_render"),
+            "table_cells": [to_plain(box) for table in page.get("structure_raw",{}).get("table_res_list",[]) or []
+                            for box in table.get("cell_box_list",[])],
             "ocr_lines": lines_for_export,
             "layout_blocks": page.get("layout_blocks", []),
             "ordered_regions": page.get("ordered_regions", []),
