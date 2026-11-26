@@ -5,6 +5,9 @@ import json
 import hashlib
 import math
 import traceback
+from time import perf_counter
+from collections import Counter
+from reportes_csv import COLUMNAS, fila_base, escribir_csv
 import unicodedata
 import html as _html
 from pathlib import Path
@@ -1566,17 +1569,20 @@ def clasificar_acto(paginas):
 
 def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=None):
     global ner_model, es_pipe
+    inicio_total = perf_counter()
     print("Etapa B iniciada: leyendo el JSON del OCR...", flush=True)
     OCR_JSON_PATH = Path(entrada)
     destino = Path(salida) if salida else OCR_JSON_PATH.with_name("sistred_gliner_detections.json")
-    if destino.exists():
-        raise ValueError("El archivo de salida ya existe; use otro nombre")
+    csv_privado = destino.with_suffix(".detecciones_privadas.csv")
+    if destino.exists() or csv_privado.exists():
+        raise ValueError("El archivo de salida o CSV ya existe; use otro nombre")
     OCR_DATA = json.loads(OCR_JSON_PATH.read_text(encoding="utf-8"))
     if OCR_DATA.get("schema_version") != "sistred_ocr_layout_v2" or not OCR_DATA.get("pages"):
         raise ValueError("JSON de OCR incompatible o vacío")
     import importlib
     destino.parent.mkdir(parents=True, exist_ok=True)
     progreso = destino.with_suffix(".progreso.json")
+    inicio_carga = perf_counter()
     gliner_module = ejecutar_etapa("Importación de GLiNER y sus dependencias", lambda: importlib.import_module("gliner"), progreso)
     GLiNER = gliner_module.GLiNER
     print(f"Modelo: {NER_MODEL_NAME}. Dispositivo: {device}. La primera ejecución puede descargar pesos.", flush=True)
@@ -1594,6 +1600,7 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
             "token-classification", model=modelo_ner_es, aggregation_strategy="simple", device=device), progreso)
     else:
         print("NER español auxiliar desactivado. Se utilizan GLiNER y las reglas; las propuestas requieren revisión humana.", flush=True)
+    segundos_carga = perf_counter() - inicio_carga
     load_gazetteer()
     tipos_documento = {}
     for nombre in {p.get("source_file") for p in OCR_DATA["pages"]}:
@@ -1603,10 +1610,13 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
     OCR_PAGES_INTERNAL = []
     ALL_DETECTIONS = []
     PAGE_ERRORS = []
+    tiempos_paginas = []
 
     for page_idx, source_page in enumerate(OCR_DATA.get("pages", []), start=1):
         label = f"{source_page.get('source_file')} — página {source_page.get('page_number')}"
         print(f"Analizando {label} ({page_idx}/{len(OCR_DATA.get('pages', []))})", flush=True)
+        inicio_pagina = perf_counter()
+        estado_pagina = "ok"
         try:
             page, block_entities, detections = ejecutar_etapa(f"Detección página {page_idx}", lambda: analizar_pagina_ocr(source_page), progreso)
             OCR_PAGES_INTERNAL.append(page)
@@ -1616,11 +1626,17 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
             ALL_DETECTIONS.extend(detections)
             print("  regiones:", len(page["blocks"]), "| detecciones:", len(detections), flush=True)
         except Exception as exc:
+            estado_pagina = "error"
             PAGE_ERRORS.append({"source_file": source_page.get("source_file"),
                                 "page_number": source_page.get("page_number"),
                                 "error": repr(exc),
                                 "traceback": traceback.format_exc()})
             print("  ERROR:", repr(exc), flush=True)
+        tiempos_paginas.append({"archivo": source_page.get("source_file"),
+                                 "pagina": source_page.get("page_number"),
+                                 "segundos_analisis_b": round(perf_counter() - inicio_pagina, 6),
+                                 "estado_b": estado_pagina,
+                                 "error_ocr": bool(source_page.get("processing_error"))})
         parcial = destino.with_suffix(".parcial.json")
         parcial.write_text(json.dumps({"schema_version": "sistred_detections_checkpoint_v1", "pages_processed": page_idx,
                            "detections": ALL_DETECTIONS, "page_errors": PAGE_ERRORS}, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1628,6 +1644,7 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
     print("\nTotal detecciones:", len(ALL_DETECTIONS))
     print("Páginas con error:", len(PAGE_ERRORS))
 
+    inicio_consolidacion = perf_counter()
     # Consistencia documental: buscar repeticiones exactas normalizadas de candidatos.
     # Cada aparición continúa siendo una propuesta y conserva su contexto/geometría.
     for document_name in {p["source_file"] for p in OCR_PAGES_INTERNAL}:
@@ -1660,7 +1677,25 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
     consolidar_menores(ALL_DETECTIONS)
     ALL_DETECTIONS = resolver_conflictos_documento([aplicar(d) for d in ALL_DETECTIONS])
 
+    segundos_consolidacion = perf_counter() - inicio_consolidacion
+    # Identificador único por fragmento final, estable para enlazar B con C.
+    conteos = {}
+    for i, d in enumerate(ALL_DETECTIONS, 1):
+        d["id_deteccion"] = f"B{i:07d}"
+        conteos.setdefault((d["source_file"], d["page"]), Counter())[d.get("tarjar", "desconocido")] += 1
+    for t in tiempos_paginas:
+        t["fragmentos_por_propuesta"] = dict(conteos.get((t["archivo"], t["pagina"]), {}))
+    tiempos = {(t["archivo"], t["pagina"]): t["segundos_analisis_b"] for t in tiempos_paginas}
+    inicio_csv = perf_counter()
+    escribir_csv(csv_privado, COLUMNAS, (fila_base(d, tiempos) for d in ALL_DETECTIONS))
+    segundos_csv = perf_counter() - inicio_csv
     DETECTIONS_OUTPUT = {
+        "rendimiento": {"device_solicitado": device,
+                         "segundos_carga_modelos": round(segundos_carga, 6),
+                         "segundos_consolidacion": round(segundos_consolidacion, 6),
+                         "segundos_csv": round(segundos_csv, 6),
+                         "segundos_b_hasta_csv": round(perf_counter() - inicio_total, 6),
+                         "paginas": tiempos_paginas},
         "tipos_documento": tipos_documento,
         "schema_version": "sistred_gliner_detections_v1",
         "source_schema": OCR_DATA.get("schema_version"),
@@ -1677,9 +1712,15 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
 
 
     destino.parent.mkdir(parents=True, exist_ok=True)
-    destino.write_text(json.dumps(DETECTIONS_OUTPUT, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        with destino.open("x", encoding="utf-8") as archivo:
+            json.dump(DETECTIONS_OUTPUT, archivo, ensure_ascii=False, indent=2)
+    except BaseException:
+        csv_privado.unlink(missing_ok=True)
+        raise
     progreso.write_text(json.dumps({"estado": "completo", "paginas": len(OCR_DATA["pages"]), "errores": len(PAGE_ERRORS)}), encoding="utf-8")
     print("Detecciones guardadas:", destino.resolve())
+    print("CSV privado de detecciones:", csv_privado.resolve())
     return destino
 
 def main(argv=None):

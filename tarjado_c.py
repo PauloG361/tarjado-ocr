@@ -10,6 +10,8 @@ import hashlib
 import io
 import json
 import math
+from time import perf_counter
+from reportes_csv import COLUMNAS_C, fila_resultado, escribir_csv
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +24,7 @@ def sha(data):
 
 class Sesion:
     def __init__(self, original, ocr_json, detecciones_json):
+        inicio_carga = perf_counter()
         self.original = Path(original)
         self.original_hash = sha(self.original.read_bytes())
         self.ocr = json.loads(Path(ocr_json).read_text(encoding="utf-8"))
@@ -51,11 +54,15 @@ class Sesion:
                     raise ValueError("El render difiere del OCR; usar el mismo entorno de renderizado")
                 self.imagenes.append(Image.frombytes("RGB", (pix.width, pix.height), pix.samples))
                 self.tamanos.append((page.rect.width, page.rect.height))
-        for d in self.datos["detections"]:
+        self.propuestas_b = {}
+        for i, d in enumerate(self.datos["detections"], 1):
             if d["source_file"] == self.original.name:
                 item = aplicar(d)
+                item.setdefault("id_deteccion", f"B{i:07d}")
                 item["review_id"] = len(self.detecciones)
+                self.propuestas_b[item["review_id"]] = dict(copy.deepcopy(d), id_deteccion=item["id_deteccion"])
                 self.detecciones.append(item)
+        self.segundos_carga_c = perf_counter() - inicio_carga
 
     def clasificar(self, tipo):
         if tipo not in TIPOS or tipo == "sin_clasificar":
@@ -251,6 +258,7 @@ class Sesion:
 
     def exportar_automatico(self, destino, *, recuadros_pendientes=True):
         """Genera una copia de prueba con recuadros de diagnóstico opcionales."""
+        inicio_decisiones = perf_counter()
         dudosas = []
         # Solo la copia automática usa la clasificación propuesta sin confirmación humana.
         if self.tipo == "sin_clasificar" and self.tipo_propuesto in TIPOS:
@@ -302,6 +310,7 @@ class Sesion:
         )
         return self._guardar_pdf(destino, leyenda, {
             "estado": "dudoso", "modo": "automatico", "dudosas": dudosas,
+            "segundos_decisiones_automaticas": round(perf_counter() - inicio_decisiones, 6),
             "recuadros_pendientes": recuadros_pendientes,
             "cantidad_recuadros": encuadradas,
             "recuadros_naranjas": naranjas,
@@ -312,19 +321,24 @@ class Sesion:
         }, recuadros_pendientes=recuadros_pendientes)
 
     def _guardar_pdf(self, destino, leyenda, datos_revision, *, recuadros_pendientes=False):
+        inicio_exportacion = perf_counter()
         if sha(self.original.read_bytes()) != self.original_hash:
             raise ValueError("El original cambió")
         destino = Path(destino)
         registro = destino.with_suffix(".revision_privada.json")
-        if destino.resolve() == self.original.resolve() or destino.exists() or registro.exists():
+        csv_privado = destino.with_suffix(".tarjado_privado.csv")
+        if destino.resolve() == self.original.resolve() or destino.exists() or registro.exists() or csv_privado.exists():
             raise ValueError("Use una salida nueva; no se sobrescriben archivos")
         doc = fitz.open()
+        tiempos_exportacion = []
         for i, (w, h) in enumerate(self.tamanos, 1):
+            inicio_pagina = perf_counter()
             image = self.imagen(i, recuadros_pendientes=recuadros_pendientes)
             buf = io.BytesIO()
             image.save(buf, format="PNG")
             p = doc.new_page(width=w, height=h)
             p.insert_image(p.rect, stream=buf.getvalue())
+            tiempos_exportacion.append({"pagina": i, "segundos_imagen_pdf": round(perf_counter() - inicio_pagina, 6)})
         # La leyenda también se rasteriza; no se importa ningún objeto del original.
         aviso = fitz.open()
         p = aviso.new_page()
@@ -341,19 +355,42 @@ class Sesion:
         with fitz.open(stream=data, filetype="pdf") as check:
             if check.embfile_count() or any(p.get_text().strip() or p.get_links() or list(p.annots() or []) for p in check):
                 raise ValueError("El PDF no superó la comprobación estructural")
-        audit = {"source_sha256": self.original_hash, "output_sha256": sha(data), "rules_version": VERSION,
+        tiempos_b = {(t["archivo"], t["pagina"]): t["segundos_analisis_b"]
+                     for t in self.datos.get("rendimiento", {}).get("paginas", [])}
+        def filas():
+            for d in self.detecciones:
+                recuadro = (self._recuadro_pendiente(d) if recuadros_pendientes and d.get("decision") == "pendiente" else None)
+                yield fila_resultado(self.propuestas_b.get(d["review_id"]),
+                                     dict(d, source_file=self.original.name), tiempos_b, recuadro=recuadro)
+        inicio_csv = perf_counter()
+        escribir_csv(csv_privado, COLUMNAS_C, filas())
+        segundos_csv = perf_counter() - inicio_csv
+        audit = {"rendimiento": {"segundos_carga_c": round(self.segundos_carga_c, 6),
+                                  "segundos_exportacion_hasta_csv": round(perf_counter() - inicio_exportacion, 6),
+                                  "segundos_csv": round(segundos_csv, 6),
+                                  "paginas": tiempos_exportacion},
+                 "source_sha256": self.original_hash, "output_sha256": sha(data), "rules_version": VERSION,
                  "tipo": self.tipo, "fecha": datetime.now(timezone.utc).isoformat(),
                  "leyenda": leyenda, "decisiones": self.detecciones, "eventos": self.eventos,
                  **datos_revision}
         registro_data = json.dumps(audit, ensure_ascii=False, indent=2)
-        with registro.open("x", encoding="utf-8") as archivo:
-            archivo.write(registro_data)
+        registro_creado = False
+        pdf_creado = False
         try:
+            with registro.open("x", encoding="utf-8") as archivo:
+                registro_creado = True
+                archivo.write(registro_data)
             with destino.open("xb") as archivo:
+                pdf_creado = True
                 archivo.write(data)
-        except OSError:
-            registro.unlink()
+        except BaseException:
+            if registro_creado:
+                registro.unlink(missing_ok=True)
+            if pdf_creado:
+                destino.unlink(missing_ok=True)
+            csv_privado.unlink(missing_ok=True)
             raise
+        print("CSV privado de tarjado:", csv_privado.resolve())
         return destino
 
 def revisar(sesion):
