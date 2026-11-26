@@ -34,6 +34,7 @@ class Sesion:
         if not self.paginas or any(p.get("source_sha256") != self.original_hash for p in self.paginas):
             raise ValueError("El OCR no corresponde al original. Vuelva a ejecutar el OCR actualizado.")
         self.tipo = "sin_clasificar"
+        self.tipo_propuesto = self.datos.get("tipos_documento", {}).get(self.original.name, {}).get("tipo", "sin_clasificar")
         self.eventos, self.revisadas = [], set()
         self.detecciones = []
         self.imagenes, self.tamanos = [], []
@@ -154,7 +155,8 @@ class Sesion:
             if recuadros_pendientes:
                 caja = self._recuadro_pendiente(d)
                 if caja is not None:
-                    draw.rectangle(caja, outline="#E87500", width=4)
+                    color = "#0078D4" if d.get("motivo_pendiente_tipo") == "geometria" else "#E87500"
+                    draw.rectangle(caja, outline=color, width=4)
             elif vista_previa:
                 for poly in d.get("polygons") or []:
                     pts = [tuple(p) for p in poly]
@@ -250,6 +252,9 @@ class Sesion:
     def exportar_automatico(self, destino, *, recuadros_pendientes=True):
         """Genera una copia de prueba con recuadros de diagnóstico opcionales."""
         dudosas = []
+        # Solo la copia automática usa la clasificación propuesta sin confirmación humana.
+        if self.tipo == "sin_clasificar" and self.tipo_propuesto in TIPOS:
+            self.tipo = self.tipo_propuesto
         lineas_por_pagina = {p["page_number"]: {l["line_index"]: l for l in p["ocr_lines"]}
                              for p in self.paginas}
         for d in self.detecciones:
@@ -267,20 +272,29 @@ class Sesion:
                     motivo = str(exc)
             else:
                 motivo = "Geometría por revisar" if propuesta == "si" else "Clasificación por revisar"
+            tipo_motivo = "geometria" if propuesta == "si" else "clasificacion"
+            d["motivo_pendiente_tipo"] = tipo_motivo
+            d["motivo_pendiente"] = motivo
             encuadrada = recuadros_pendientes and self._recuadro_pendiente(d) is not None
             dudosas.append({"id": d["review_id"], "pagina": d["page"],
                             "categoria": d["category"], "motivo": motivo,
-                            "recuadro_diagnostico": encuadrada})
+                            "recuadro_diagnostico": encuadrada,
+                            "tipo_motivo": tipo_motivo,
+                            "color_recuadro": ("azul" if tipo_motivo == "geometria" else "naranja") if encuadrada else None})
         aplicadas = sum(d["decision"] == "aceptar" for d in self.detecciones)
         encuadradas = sum(d["recuadro_diagnostico"] for d in dudosas)
+        naranjas = sum(d["color_recuadro"] == "naranja" for d in dudosas)
+        azules = sum(d["color_recuadro"] == "azul" for d in dudosas)
         aviso_recuadros = (
-            f"Pendientes con recuadro naranja (datos visibles): {encuadradas}.\n"
+            f"Recuadros naranjas: {naranjas} (clasificación por revisar).\n"
+            f"Recuadros azules: {azules} (geometría por revisar).\n"
             f"Pendientes sin recuadro localizable: {len(dudosas) - encuadradas}.\n"
             "Los recuadros pueden ser aproximados; no equivalen a un tarjado.\n"
         ) if recuadros_pendientes else "Recuadros de diagnóstico desactivados.\n"
         leyenda = (
             "COPIA DUDOSA - PENDIENTE DE REVISIÓN\n\n"
             "Tarjado automático de prueba. Uso interno. Los casos pendientes pueden seguir visibles.\n"
+            f"Tipo de acto propuesto: {self.tipo_propuesto}.\n"
             f"Zonas tarjadas automáticamente: {aplicadas}.\n"
             f"Zonas pendientes de decisión: {len(dudosas)}.\n"
             f"{aviso_recuadros}"
@@ -290,6 +304,9 @@ class Sesion:
             "estado": "dudoso", "modo": "automatico", "dudosas": dudosas,
             "recuadros_pendientes": recuadros_pendientes,
             "cantidad_recuadros": encuadradas,
+            "recuadros_naranjas": naranjas,
+            "recuadros_azules": azules,
+            "tipo_acto_propuesto": self.tipo_propuesto,
             "paginas_con_error": sorted(set(self.errores)),
             "paginas_por_revisar": list(range(1, len(self.paginas) + 1)),
         }, recuadros_pendientes=recuadros_pendientes)
