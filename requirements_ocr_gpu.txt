@@ -1,0 +1,4 @@
+# Componente GPU de OCR para el entorno existente. No configura PyTorch/GLiNER.
+# Antes de usarlo, desinstalar paddlepaddle (CPU); no instalar ambos paquetes.
+--extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/
+paddlepaddle-gpu==3.2.2

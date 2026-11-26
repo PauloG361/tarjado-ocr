@@ -1,0 +1,11 @@
+.venv*/
+.uv-cache/
+.uv-python/
+.hf-cache/
+.paddlex-cache/
+__pycache__/
+pdfs/
+tarjados*/
+resultados/
+*.pdf
+*.revision_privada.json

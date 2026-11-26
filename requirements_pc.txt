@@ -1,0 +1,12 @@
+# CPU. Instalar en Python 3.11 de 64 bits dentro de .venv.
+# Se conservan las versiones OCR del prototipo; validar en el equipo destino.
+paddlepaddle==3.2.0
+paddleocr[doc-parser]==3.7.0
+paddlex[ocr]==3.7.2
+pymupdf>=1.24
+pillow>=10
+numpy
+opencv-python
+gliner
+transformers
+torch
