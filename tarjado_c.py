@@ -113,18 +113,58 @@ class Sesion:
         self.eventos.append({"accion": "revision_visual_completa", "pagina": pagina,
                              "fecha": datetime.now(timezone.utc).isoformat()})
 
-    def imagen(self, pagina, vista_previa=False):
+    def _recuadro_pendiente(self, d):
+        """Caja visual de diagnóstico; no autoriza una franja de tarjado."""
+        pagina = d.get("page")
+        if not isinstance(pagina, int) or not 1 <= pagina <= len(self.imagenes):
+            return None
+        w, h = self.imagenes[pagina - 1].size
+
+        def validar(caja):
+            if caja is None or len(caja) != 4 or not all(math.isfinite(v) for v in caja):
+                return None
+            x0, y0, x1, y1 = caja
+            if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+                return None
+            return (max(0, math.floor(x0) - 3), max(0, math.floor(y0) - 3),
+                    min(w - 1, math.ceil(x1) + 3), min(h - 1, math.ceil(y1) + 3))
+
+        # Priorizar polígonos del dato; usar la caja OCR si no son utilizables.
+        try:
+            puntos = [p for poly in (d.get("polygons") or []) for p in poly]
+            if puntos and all(len(p) == 2 and all(math.isfinite(v) for v in p) for p in puntos):
+                xs, ys = zip(*puntos)
+                caja = validar((min(xs), min(ys), max(xs), max(ys)))
+                if caja is not None:
+                    return caja
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            return validar(d.get("bbox_xyxy"))
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    def imagen(self, pagina, vista_previa=False, recuadros_pendientes=False):
         im = self.imagenes[pagina-1].copy()
         draw = ImageDraw.Draw(im)
-        for d in self.detecciones:
-            if d["page"] != pagina:
+        zonas = [d for d in self.detecciones if d["page"] == pagina]
+        for d in zonas:
+            if d["decision"] != "pendiente":
                 continue
-            for poly in d.get("polygons") or []:
-                pts = [tuple(p) for p in poly]
-                if d["decision"] == "aceptar":
-                    draw.polygon(pts, fill="black")
-                elif vista_previa and d["decision"] == "pendiente":
-                    draw.line(pts+[pts[0]], fill="orange", width=3)
+            if recuadros_pendientes:
+                caja = self._recuadro_pendiente(d)
+                if caja is not None:
+                    draw.rectangle(caja, outline="#E87500", width=4)
+            elif vista_previa:
+                for poly in d.get("polygons") or []:
+                    pts = [tuple(p) for p in poly]
+                    if pts:
+                        draw.line(pts+[pts[0]], fill="orange", width=3)
+        # Las franjas negras van al final para conservar la opacidad.
+        for d in zonas:
+            if d["decision"] == "aceptar":
+                for poly in d.get("polygons") or []:
+                    draw.polygon([tuple(p) for p in poly], fill="black")
         return im
 
     def exportar(self, destino, revisor, leyenda, comprobaciones):
@@ -207,8 +247,8 @@ class Sesion:
         x0, y0, x1, y1 = franja
         return [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]
 
-    def exportar_automatico(self, destino):
-        """Genera una copia de prueba y registra lo que queda por revisar."""
+    def exportar_automatico(self, destino, *, recuadros_pendientes=True):
+        """Genera una copia de prueba con recuadros de diagnóstico opcionales."""
         dudosas = []
         lineas_por_pagina = {p["page_number"]: {l["line_index"]: l for l in p["ocr_lines"]}
                              for p in self.paginas}
@@ -227,23 +267,34 @@ class Sesion:
                     motivo = str(exc)
             else:
                 motivo = "Geometría por revisar" if propuesta == "si" else "Clasificación por revisar"
+            encuadrada = recuadros_pendientes and self._recuadro_pendiente(d) is not None
             dudosas.append({"id": d["review_id"], "pagina": d["page"],
-                            "categoria": d["category"], "motivo": motivo})
+                            "categoria": d["category"], "motivo": motivo,
+                            "recuadro_diagnostico": encuadrada})
         aplicadas = sum(d["decision"] == "aceptar" for d in self.detecciones)
+        encuadradas = sum(d["recuadro_diagnostico"] for d in dudosas)
+        aviso_recuadros = (
+            f"Pendientes con recuadro naranja (datos visibles): {encuadradas}.\n"
+            f"Pendientes sin recuadro localizable: {len(dudosas) - encuadradas}.\n"
+            "Los recuadros pueden ser aproximados; no equivalen a un tarjado.\n"
+        ) if recuadros_pendientes else "Recuadros de diagnóstico desactivados.\n"
         leyenda = (
             "COPIA DUDOSA - PENDIENTE DE REVISIÓN\n\n"
             "Tarjado automático de prueba. Uso interno. Los casos pendientes pueden seguir visibles.\n"
             f"Zonas tarjadas automáticamente: {aplicadas}.\n"
             f"Zonas pendientes de decisión: {len(dudosas)}.\n"
-            "Revisar visualmente todas las páginas, incluidas firmas, imágenes y códigos QR."
+            f"{aviso_recuadros}"
+            "NO PUBLICAR. Revisar visualmente todas las páginas, incluidas firmas, imágenes y códigos QR."
         )
         return self._guardar_pdf(destino, leyenda, {
             "estado": "dudoso", "modo": "automatico", "dudosas": dudosas,
+            "recuadros_pendientes": recuadros_pendientes,
+            "cantidad_recuadros": encuadradas,
             "paginas_con_error": sorted(set(self.errores)),
             "paginas_por_revisar": list(range(1, len(self.paginas) + 1)),
-        })
+        }, recuadros_pendientes=recuadros_pendientes)
 
-    def _guardar_pdf(self, destino, leyenda, datos_revision):
+    def _guardar_pdf(self, destino, leyenda, datos_revision, *, recuadros_pendientes=False):
         if sha(self.original.read_bytes()) != self.original_hash:
             raise ValueError("El original cambió")
         destino = Path(destino)
@@ -252,7 +303,7 @@ class Sesion:
             raise ValueError("Use una salida nueva; no se sobrescriben archivos")
         doc = fitz.open()
         for i, (w, h) in enumerate(self.tamanos, 1):
-            image = self.imagen(i)
+            image = self.imagen(i, recuadros_pendientes=recuadros_pendientes)
             buf = io.BytesIO()
             image.save(buf, format="PNG")
             p = doc.new_page(width=w, height=h)
@@ -543,6 +594,8 @@ def main(argv=None):
     parser.add_argument("detecciones", type=Path)
     parser.add_argument("--automatico", type=Path, metavar="PDF_DE_SALIDA",
                         help="Exportar una copia dudosa sin abrir la ventana")
+    parser.add_argument("--sin-recuadros", action="store_true",
+                        help="Omitir recuadros naranjas de pendientes en la copia automática")
     args = parser.parse_args(argv)
     try:
         sesion = Sesion(args.original, args.ocr, args.detecciones)
@@ -550,7 +603,7 @@ def main(argv=None):
             revisar_pc(sesion)
         else:
             args.automatico.parent.mkdir(parents=True, exist_ok=True)
-            print(sesion.exportar_automatico(args.automatico))
+            print(sesion.exportar_automatico(args.automatico, recuadros_pendientes=not args.sin_recuadros))
     except (ImportError, ValueError, OSError) as exc:
         parser.exit(1, f"Error: {exc}\n")
 
