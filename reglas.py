@@ -1,9 +1,10 @@
 """Política de propuestas de tarjado. Única fuente de decisiones, no aprobación."""
 import re
 
-VERSION = "2026-11-26.3"
+VERSION = "2026-11-26.4"
 TIPOS = ("sin_clasificar", "destinacion_ffaa", "arriendo", "titulo_gratuito", "saneamiento", "otro")
 REGLAS = {
+    "identificador_administrativo": ["RNA-14", "RNA-15"],
     "run_rut": ["RNA-05", "RNA-08", "RNA-14"],
     "run_rut_personal": ["RNA-05", "RNA-08"],
     "run_rut_juridico": ["RNA-14"],
@@ -32,7 +33,7 @@ _SI = frozenset({"run_rut_personal", "direccion_personal", "correo_personal", "t
                  "estado_civil", "fecha_nacimiento", "nacionalidad_personal", "persona_menor", "dato_menor",
                  "dato_financiero_personal", "dato_previsional_personal", "dato_salud_personal",
                  "codigo_validacion", "vinculo_validacion", "qr", "fotografia", "huella"})
-_NO = frozenset({"run_rut_juridico", "persona_funcionario", "correo_institucional", "telefono_institucional"})
+_NO = frozenset({"identificador_administrativo", "run_rut_juridico", "persona_funcionario", "correo_institucional", "telefono_institucional"})
 _CONFLICTOS = {"conflicto_contextual_documental", "revisar_contexto_repeticion", "titularidad_contradictoria"}
 
 def politica(categoria, tipo="sin_clasificar", *, base="", flags=()):

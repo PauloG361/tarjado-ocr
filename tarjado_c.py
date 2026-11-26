@@ -236,25 +236,58 @@ class Sesion:
         if fuera:
             raise ValueError("Faltan coordenadas del texto vecino en la misma línea")
 
-        protegidos.extend(limites(otra["polygon"]) for otro, otra in lineas.items()
-                          if otro != indice and otra.get("polygon"))
-        for caja in protegidos:
-            if not cruza(franja, caja):
-                continue
-            if cruza(base, caja):
-                raise ValueError("La franja invadiría texto vecino")
-            # Recortar el margen donde la caja vecina se acerque a la franja.
-            if caja[2] < base[0]:
-                franja[0] = max(franja[0], math.floor(caja[2]) + 1)
-            if caja[0] > base[2]:
-                franja[2] = min(franja[2], math.ceil(caja[0]) - 1)
-            if caja[3] < base[1]:
-                franja[1] = max(franja[1], math.floor(caja[3]) + 1)
-            if caja[1] > base[3]:
-                franja[3] = min(franja[3], math.ceil(caja[1]) - 1)
+        # Las líneas inclinadas pueden tener cajas envolventes que se cruzan sin
+        # que sus polígonos se toquen. Usar la envolvente convexa real de la línea,
+        # y mantener las cajas de palabras como evidencia adicional conservadora.
+        def rect(c):
+            a,b,c,d=c
+            return [(a,b),(c,b),(c,d),(a,d)]
 
-        x0, y0, x1, y1 = franja
-        return [[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]]
+        def hull(points):
+            pts=sorted(set(tuple(p) for p in points))
+            def cross(o,a,b): return (a[0]-o[0])*(b[1]-o[1])-(a[1]-o[1])*(b[0]-o[0])
+            lo=[]; hi=[]
+            for p in pts:
+                while len(lo)>=2 and cross(lo[-2],lo[-1],p)<=0: lo.pop()
+                lo.append(p)
+            for p in reversed(pts):
+                while len(hi)>=2 and cross(hi[-2],hi[-1],p)<=0: hi.pop()
+                hi.append(p)
+            return lo[:-1]+hi[:-1]
+
+        def intersect(a,b):
+            # Teorema del eje separador para polígonos convexos. El contacto
+            # también cuenta como colisión; no se ignora ningún píxel de borde.
+            for poly in (a,b):
+                for i,p in enumerate(poly):
+                    q=poly[(i+1)%len(poly)]; dx,dy=q[0]-p[0],q[1]-p[1]
+                    if not dx and not dy: continue
+                    pa=[-dy*x+dx*y for x,y in a]; pb=[-dy*x+dx*y for x,y in b]
+                    if max(pa)<min(pb) or max(pb)<min(pa): return False
+            return True
+
+        otros = [rect(c) for c in protegidos]
+        for otro, otra in lineas.items():
+            if otro==indice: continue
+            poly=otra.get("polygon")
+            if not poly:
+                if otra.get("bbox_xyxy"): poly=rect(otra["bbox_xyxy"])
+                else: raise ValueError("Faltan coordenadas de una línea vecina")
+            h=hull(poly)
+            if len(h)<3: raise ValueError("Polígono vecino inválido")
+            # Los polígonos OCR pueden tener palabras estimadas que sobresalen;
+            # no se descarta esa evidencia para ganar cobertura artificialmente.
+            otros.append(h)
+            otros.extend(hull(w["polygon"]) for w in otra.get("words",[]) if w.get("polygon"))
+        otros=[p for p in otros if len(p)>=3 and cruza(limites(p),franja)]
+        if any(intersect(rect(base),p) for p in otros):
+            raise ValueError("La franja invadiría texto vecino (polígono)")
+        # Probar márgenes decrecientes sin reducir la superficie del dato.
+        for m in range(margen,-1,-1):
+            candidate=(max(0,x0-m),max(0,y0-m),min(ancho-1,x1+m),min(alto-1,y1+m))
+            if not any(intersect(rect(candidate),p) for p in otros):
+                return [rect(candidate)]
+        raise ValueError("No se pudo generar una franja segura")
 
     def exportar_automatico(self, destino, *, recuadros_pendientes=True):
         """Genera una copia de prueba con recuadros de diagnóstico opcionales."""

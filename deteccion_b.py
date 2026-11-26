@@ -103,7 +103,7 @@ CUE_MAX_DISTANCE = 80              # caracteres entre un cue de contexto y la en
 
 ADDRESS_CUE_DISTANCE = 140
 
-PROPAGAR_NOMBRES = True
+PROPAGAR_NOMBRES = False  # V4: no multiplicar nombres aún no confirmados
 
 PROPAGATE_MIN_SCORE = 0.55
 
@@ -658,6 +658,14 @@ _CONTACT_CUE = {
 _NATIONALITY = r"(?:chilen[oa]|argentin[oa]|peruan[oa]|bolivian[oa]|colombian[oa]|venezolan[oa]|ecuatorian[oa]|brasilen[oa]|uruguay[oa]|paraguay[oa]|mexican[oa]|espanol[ae]?|espanola|frances[ae]?|italian[oa]|alemana?|estadounidense|canadiense|haitian[oa]|cuban[oa]|dominican[oa]|chin[oa]|japones[ae]?|extranjer[oa])"
 # Capturar solo el valor; no la etiqueta ni datos de otra cláusula.
 _CONTEXT_FIELDS = [
+    ("dato_financiero_personal", r"\b(?:cuenta\s+(?:bancaria|corriente|vista|de\s+ahorro|rut))\s*(?:personal|particular|del\s+(?:solicitante|titular))?\s*(?:n[°ºo.]\s*|es\s+)?[:：]?\s*(?P<v>\d[\d. -]{3,24}\d)(?!\d)"),
+    ("dato_financiero_personal", r"\b(?:saldo\s+(?:bancario|disponible|de\s+(?:su\s+)?cuenta)|ingreso\s+mensual|sueldo)\s*(?:personal|particular|individual)?\s*(?:de|es|alcanza)?\s*[:：]?\s*(?P<v>\$\s*\d[\d.,]*\d|\$\s*\d)"),
+    ("dato_previsional_personal", r"\b(?:afiliad[oa]\s+a|afiliacion\s+(?:previsional\s+)?a)\s+(?P<v>afp\s+[a-z][a-z0-9-]*(?:\s+(?:de|del)\s+[a-z][a-z0-9-]*)?)\b"),
+    ("dato_previsional_personal", r"\b(?:cotizaciones?\s+previsionales?|cotizaciones?\s+personales?)\s*(?:personales?|individuales?)?\s*(?:alcanzan?|ascienden?\s+a|de|es)?\s*[:：]?\s*(?P<v>\$\s*\d[\d.,]*\d|\$\s*\d)"),
+    ("dato_previsional_personal", r"\b(?:numero\s+de\s+)?afiliacion\s+individual\s*(?:es\s+)?[:：]?\s*(?P<v>[a-z0-9-]*\d[a-z0-9-]*)"),
+    ("dato_salud_personal", r"\b(?:diagnostico\s+medico|tratamiento\s+medico|discapacidad)\s*(?:de\s+tipo|de|con|:)\s*(?P<v>[^;,.]{2,75}?)(?=\s+(?:y\s+(?:tratamiento|controles|reside|presenta)|se\s+indica|el\s+acta)|[;,.]|$)"),
+    ("dato_salud_personal", r"\bcondicion\s+de\s+salud\s*(?:de\s+|:\s*)?(?P<v>[^;,.]{2,65}?)(?=\s+y\s+(?:controles|tratamiento|reside)|[;,.]|$)"),
+    ("dato_salud_personal", r"\b(?:afiliacion\s+de\s+salud\s+personal\s+a)\s+(?P<v>fonasa(?:\s+y\s+tramo\s+[abcd])?|isapre\s+[a-z]+)\b"),
     ("dato_financiero_personal", r"\b(?:cuenta\s+(?:bancaria|corriente|vista|de\s+ahorro)|cuenta\s+rut)\s*(?:n[°ºo.]\s*)?[:：]?\s*(?P<v>\d[\d. -]{3,24}\d)(?!\d)"),
     ("dato_financiero_personal", r"\b(?:saldo\s+(?:bancario|de\s+(?:su\s+)?cuenta)|saldo\s+personal|ingreso\s+mensual\s+personal|sueldo\s+personal)\s*(?:de\s+)?[:：]?\s*(?P<v>\$\s*\d[\d.,]*)"),
     ("dato_previsional_personal", r"\b(?:afiliad[oa]\s+a\s+|afiliacion\s+(?:previsional\s+)?(?:a\s+)?|prevision\s*[:：]\s*)?(?P<v>afp\s+[a-z][a-z0-9-]*(?:\s+(?:capital|habitat|modelo|planvital|provida|cuprum|uno))?)\b"),
@@ -691,6 +699,12 @@ def _add_candidate(ents, text, s, e, cat, basis, score=.9, owner=None):
     ents.append(x)
 
 
+def nombre_plausible(value):
+    f = fold(value)
+    return (len(f.split()) >= 2 and not _ORG_SUFFIX.search(f)
+            and not re.search(r"\d|[@/]|^(?:pasaje|calle|avenida|avda|camino|ruta|parcela|sector|colegio|escuela|hospital|centro|inmueble|predio|domicilio|correo|resolucion|expediente)\b", f))
+
+
 def contextualizar(text, ents, role=""):
     """Relaciona candidatos en una cláusula. Evidencia débil queda en revisión."""
     f = fold(text)
@@ -709,7 +723,9 @@ def contextualizar(text, ents, role=""):
     owners = []
     for p in people:
         if any(_ov(p["s"],p["e"],q["s"],q["e"]) for q in owners): continue
-        if len(p["text"].split()) < 2 or _ORG_SUFFIX.search(fold(p["text"])): continue
+        if not nombre_plausible(p["text"]): continue
+        if any(x is not p and x["category"].startswith(("direccion_", "correo_"))
+               and x["s"] <= p["s"] and p["e"] <= x["e"] for x in ents): continue
         a,b = _clause(text,p["s"],p["e"])
         left, right = f[max(a,p["s"]-85):p["s"]],f[p["e"]:min(b,p["e"]+90)]
         public = bool(re.search(rf"\b{_PUBLIC_ROLE}\s*[:,]?\s*$",left) or re.match(rf"\s*[,(-]?\s*{_PUBLIC_ROLE}\b",right))
@@ -762,6 +778,8 @@ def contextualizar(text, ents, role=""):
                 elif re.search(r"\b(?:inmueble|predio|terreno|propiedad\s+fiscal)\b[^;]{0,40}\b(?:ubicad[oa]|direccion)\s*(?:en\s+)?[:：]?\s*$",local): explicit="inmueble"
             if explicit:
                 x.update(category=family+"_"+explicit,basis="contexto_local_explicito")
+            elif family in {"correo", "telefono"} and cat.endswith("_institucional") and x["basis"]=="contexto":
+                x.update(category=family+"_revisar",basis="contexto_no_vinculado")
             elif owner and _CONTACT_CUE[family].search(local) and cat not in {family+"_institucional",family+"_inmueble"}:
                 # Contacto genérico de funcionario no es necesariamente privado.
                 if owner["role"] in {"natural","menor"}:
@@ -789,7 +807,7 @@ def contextualizar(text, ents, role=""):
         s,e=m.span("v"); val=f[s:e]
         if re.search(r"\b(?:calle|pasaje|camino|ruta|sector|parcela|villa|poblacion|avenida|avda|s/n|sin\s+numero)\b",val):
             # Cortar antes de otros campos y no invadir contenido de un acto.
-            cut=re.search(r"\s+(?:rut|run|correo|telefono|nacionalidad|estado\s+civil|inmueble\s+fiscal)\b",val)
+            cut=re.search(r"\s+(?:rut|run|correo|telefono|nacionalidad|estado\s+civil|inmueble\s+fiscal|y\s+cursa|y\s+estudia|y\s+asiste)\b",val)
             if cut:e=s+cut.start()
             _add_candidate(ents,text,s,e,"direccion_personal","domicilio_explicito",owner=owner_for(s,e))
     for m in re.finditer(r"\b(?:inmueble|predio|terreno|propiedad\s+fiscal)\b[^;\n,.]{0,40}\b(?:ubicad[oa]\s+en|direccion\s*[:：])\s*(?P<v>[^;\n,.]{4,90}(?:,\s*(?:villa|poblacion|sector|comuna)\s+[^;\n,.]{1,40})?)", f):
@@ -807,9 +825,11 @@ def contextualizar(text, ents, role=""):
             cut=re.search(r"\s+(?:y\s+)?(?:rut|run|correo|telefono|nacionalidad|domicilio|inmueble|expediente|resolucion|decreto|cotizacion|saldo)\b",f[s:e])
             if cut:e=s+cut.start()
             # Sin un titular, una etiqueta de AFP/diagnóstico puede referir a una institución o norma.
-            explicit=bool(re.search(r"\b(?:personal|particular|su|del\s+titular|del\s+solicitante|del\s+representante)\b",prefix+" "+f[m.start():s]))
+            explicit=bool(re.search(r"\b(?:personal|personales|particular|individual|del\s+titular|del\s+solicitante|del\s+representante)\b",f[m.start():s]) or re.search(r"\b(?:su|sus)\s*$",prefix))
             if cat=="dato_financiero_personal" and _PUBLIC_FIELD.search(prefix) and not explicit: owner=None
             if owner and owner["role"]=="funcionario" and not explicit: owner=None
+            # Un rótulo inequívoco de afiliación individual identifica el carácter privado.
+            explicit |= bool(re.search(r"\b(?:afiliacion\s+individual|cotizaciones?\s+previsionales?\s+personales?)\b", f[m.start():s]))
             if owner or explicit:
                 target=cat
             else: target=cat.removesuffix("_personal")
@@ -974,7 +994,7 @@ def detect_block(block, gl_ents, es_ents):
             cat = "codigo_validacion_revisar"
         basis = "codigo_validacion_explicito" if cat == "codigo_validacion" else "requiere_confirmacion"
         ents.append(mk(text, s, e, cat, 0.95 if cat == "codigo_validacion" else 0.5, ["regla_contextual"], basis))
-    return resolve_overlaps(contextualizar(text, ents, block.get("role", "")))
+    return resolve_overlaps(filtrar_candidatos(text, contextualizar(text, ents, block.get("role", ""))))
 
 STOP_TOKENS = {"de", "del", "la", "las", "los", "el", "y", "e", "da", "do", "van", "von"}
 
@@ -1301,6 +1321,105 @@ def _bbox_from_polygon(poly):
     return [min(p[0] for p in pts), min(p[1] for p in pts),
             max(p[0] for p in pts), max(p[1] for p in pts)]
 
+
+# Etiquetas completas, no coincidencias por distancia entre filas de una tabla.
+_TABLE_FIELDS = [
+    (r"(?:run|cedula(?: de identidad)?|identificador personal)(?: (?:del? |de la )?(?:solicitante|representante(?: legal)?|menor|afiliado|titular|compareciente|interesad[oa]|adult[oa]|personal))?(?: \(dv err[oó]neo\)|, variante \d+)?|rut (?:personal|adult[oa]|del representante(?: legal)?)|rut / run adult[oa]", "run_rut_personal"),
+    (r"(?:rut (?:de la )?(?:empresa|sociedad|persona juridica)|identificador persona juridica)", "run_rut_juridico"),
+    (r"(?:correo|email) (?:personal|particular)(?: .+)?", "correo_personal"),
+    (r"(?:correo|email) institucional(?: .+)?|oficina de partes", "correo_institucional"),
+    (r"(?:telefono|celular|contacto) (?:personal|particular|del (?:adulto|solicitante))", "telefono_personal"),
+    (r"(?:telefono institucional|mesa central)", "telefono_institucional"),
+    (r"(?:domicilio|direccion) particular(?: repetida)?", "direccion_personal"),
+    (r"direccion (?:del )?(?:inmueble fiscal|bien fiscal|predio fiscal)", "direccion_inmueble"),
+    (r"(?:nombre completo de la menor|nombre menor|nombre del menor)", "persona_menor"),
+    (r"(?:edad / curso menor|colegio menor|establecimiento del menor)", "dato_menor"),
+    (r"nacionalidad(?: de la menor| del menor)?", "nacionalidad_personal"),
+    (r"fecha (?:de )?nacimiento", "fecha_nacimiento"),
+    (r"estado civil", "estado_civil"),
+    (r"(?:cuenta bancaria del solicitante|cuenta bancaria personal|saldo (?:disponible|bancario) personal|ingreso mensual personal)", "dato_financiero_personal"),
+    (r"(?:afp del afiliado|cotizacion individual|cotizaciones personales|numero (?:de )?afiliacion)", "dato_previsional_personal"),
+    (r"(?:diagnostico titular|tratamiento titular|dato salud menor|tratamiento medico|afiliacion de salud de .+)", "dato_salud_personal"),
+    (r"(?:codigo de (?:validacion|verificacion))", "codigo_validacion"),
+    (r"vinculo de validacion", "vinculo_validacion"),
+    (r"(?:funcionario responsable|nombre funcionari[oa])", "persona_funcionario"),
+    (r"(?:nombre adult[oa]|arrendatario|nombre de familiar adulto|vecino en deslinde|profesion(?: declarada)?|numero de garantia|garantia|monto adeudado|profesional informante.*)", "dato_pendiente"),
+    (r"(?:plano(?: del inmueble)?|referencia de plano fiscal)", "plano"),
+    (r"(?:deslinde )?(?:norte|sur|este|oeste|oriente|poniente)", "deslindes"),
+    (r"(?:rol de avaluo|superficie|canon mensual fiscal|fecha (?:acto|del informe|de recepcion)|numero resolucion|numero de resolucion|folio administrativo|documento de referencia|cargo(?: publico)?|entidad general.*)", "identificador_administrativo"),
+]
+
+
+def categoria_rotulo(text):
+    f = ' '.join(fold(text).strip(' :：').split())
+    return next((cat for rx,cat in _TABLE_FIELDS if re.fullmatch(rx,f)),None)
+
+
+def valor_compatible(cat, value):
+    v=value.strip(); f=fold(v)
+    if cat.startswith('run_rut_'): return bool(RUT_RE.fullmatch(v))
+    if cat.startswith('correo_'): return bool(EMAIL_RE.fullmatch(v))
+    if cat.startswith('telefono_'): return 8<=len(re.sub(r'\D','',v))<=11 and bool(re.fullmatch(r'[+\d ()-]+',v))
+    if cat in {'persona_menor','persona_funcionario'}: return nombre_plausible(v)
+    if cat=='nacionalidad_personal': return bool(re.fullmatch(_NATIONALITY,f))
+    if cat=='fecha_nacimiento': return bool(re.fullmatch(r'\d{1,2}[/.-]\d{1,2}[/.-]\d{2,4}|\d{4}-\d{2}-\d{2}|\d{1,2} de [a-z]+ de \d{4}',f))
+    if cat=='estado_civil': return bool(find_estado_civil(v))
+    if cat=='codigo_validacion': return bool(re.fullmatch(r'[\w-]{4,}',v) and re.search(r'\d',v))
+    if cat=='vinculo_validacion': return bool(re.fullmatch(r'https?://\S+',v,re.I))
+    if cat=='dato_financiero_personal': return bool(re.search(r'\d',v))
+    return 2<=len(v)<=160 and categoria_rotulo(v) is None
+
+
+def pares_tabla(lines):
+    """Emparejar solo rótulos a la izquierda con valores de la misma fila; abstenerse ante ambigüedad."""
+    def cy(l): return (l['bbox'][1]+l['bbox'][3])/2
+    def h(l): return l['bbox'][3]-l['bbox'][1]
+    rows=[l for l in lines if l.get('bbox') and l['text'].strip()]
+    def cat_of(l):
+        f=' '.join(fold(l['text']).split())
+        cat=categoria_rotulo(l['text'])
+        if f=='curso escolar' and any(categoria_rotulo(x['text'])=='persona_menor' for x in rows): return 'dato_menor'
+        return cat
+    labels=[l for l in rows if cat_of(l)]
+    values=[l for l in rows if not cat_of(l)]
+    options={}
+    for l in labels:
+        cat=cat_of(l)
+        possible=[v for v in values if v['bbox'][0]>=l['bbox'][2]-3
+                  and abs(cy(l)-cy(v))<=max(h(l),h(v))*.65 and valor_compatible(cat,v['text'])]
+        if len(possible)==1: options[l['line_index']]=possible[0]
+    counts=Counter(v['line_index'] for v in options.values())
+    return {v['line_index']:cat_of(l) for l in labels
+            if (v:=options.get(l['line_index'])) is not None and counts[v['line_index']]==1}
+
+
+def campos_administrativos(text):
+    f=fold(text)
+    for m in re.finditer(r'\b(?:resolucion(?:\s+exenta)?(?:\s+de\s+\w+)?|decreto(?:\s+exento)?|oficio)\s+(?:n[°ºo.]\s*|numero\s+)([\w./-]*\d[\w./-]*?)(?=\s|expediente|[;,]|$)|\b(?:expediente|folio administrativo)\s*[:：]?\s*([\w.-]*\d[\w.-]*)',f):
+        group=1 if m.group(1) else 2
+        yield m.span(group)
+
+
+def filtrar_candidatos(text, ents):
+    for a,b in campos_administrativos(text):
+        _add_candidate(ents,text,a,b,'identificador_administrativo','identificador_acto_explicito',.99)
+    # No permitir que una hipótesis de nombre cree un menor dentro de otro tipo de campo.
+    strong=[x for x in ents if x['category'].startswith(('direccion_','correo_','telefono_')) and x['basis'] not in {'solo_gliner','sin_evidencia','contexto_no_vinculado'}]
+    out=[]
+    for x in ents:
+        cat=x['category']; val=fold(x['text']).strip()
+        if cat.startswith('persona') and ((len(x['text'].split())>=2 and not nombre_plausible(x['text'])) or any(y['s']<=x['s'] and x['e']<=y['e'] for y in strong)):
+            continue
+        # Una etiqueta de profesión aislada no basta para convertir encabezados,
+        # nombres institucionales o palabras genéricas en campos RNA-13.
+        if cat=='dato_pendiente' and x['sources']==['gliner'] and not re.search(r'\b(?:profesion|oficio|garantia|adeudad[oa]|vecino|familiar|tercero|postulante)\b', fold(text[max(0,x['s']-40):min(len(text),x['e']+30)])):
+            generic = val in {'ejercicio','ejercicio tecnico','inmueble fiscal','tratamiento'} or any(y['category'].startswith('correo_') and y['s']<=x['s'] and x['e']<=y['e'] for y in ents)
+            org = any(y['category'] in {'ignorar:organizacion','ignorar:institucion'} and y['s']<=x['s'] and x['e']<=y['e'] for y in ents)
+            if generic or org: continue
+        if cat=='dato_salud' and val in {'tratamiento','diagnostico','salud','enfermedad','medico','medica'}: continue
+        out.append(x)
+    return out
+
 def _convert_ocr_page(source_page):
     """Convierte el esquema de exportación OCR al formato interno del notebook GLiNER."""
     lines = []
@@ -1322,6 +1441,17 @@ def _convert_ocr_page(source_page):
     lines_by_id = {line["line_index"]: line for line in lines}
     page_blocks = []
     for region_index, region in enumerate(source_page.get("ordered_regions", [])):
+        if region.get("label") == "table":
+            cells = [lines_by_id[int(i)] for i in region.get("line_indices", []) if int(i) in lines_by_id]
+            pares = pares_tabla(cells)
+            for line in cells:
+                t=line["text"]
+                if not t.strip(): continue
+                page_blocks.append({"block_id": region.get("block_id", region_index), "role":"table",
+                                    "text":t,"spans":[{"line_index":line["line_index"],"block_start":0,"block_end":len(t),"line_start":0}],
+                                    "block_order":region.get("block_order"),"table_category":pares.get(line["line_index"]),
+                                    "table_label":bool(categoria_rotulo(t))})
+            continue
         spans, parts, pos = [], [], 0
         for line_index in region.get("line_indices", []):
             line = lines_by_id.get(int(line_index))
@@ -1393,6 +1523,13 @@ def analizar_pagina_ocr(source_page, propagar=True):
     page = _convert_ocr_page(source_page)
     block_entities = []
     for block in page["blocks"]:
+        if block.get("table_category"):
+            t=block["text"]; cat=block["table_category"]
+            x=mk(t,0,len(t),cat,.95,["regla_contextual","tabla_geometrica"],"rotulo_tabla_explicito")
+            if cat.startswith("persona_"): x.update(owner=t,owner_role="menor" if cat=="persona_menor" else "funcionario")
+            block_entities.append([x]); continue
+        if block.get("table_label"):
+            block_entities.append([]); continue
         view = ner_view(block)
         gl_entities = gliner_multipass(view)
         es_entities = es_raw(view)
@@ -1451,12 +1588,18 @@ def consolidar_repeticiones_seguras(detecciones):
                     and d.get("tarjar") == "si"
                     and "consistencia_documental" not in d.get("sources", [])]
         opuestas = [d for d in grupo if categorias[d["category"]][1] == "no"
-                   and "consistencia_documental" not in d.get("sources", [])]
+                   and "consistencia_documental" not in d.get("sources", [])
+                   and d.get("classification_basis") not in {"contexto","sin_evidencia","solo_gliner"}]
+        for d in grupo:
+            if categorias[d["category"]][1] == "no" and d.get("classification_basis") == "contexto" and d not in opuestas:
+                # No propagar una inferencia por proximidad como veto documental.
+                d["category"] = {"correo":"correo_revisar","telefono":"telefono_revisar","direccion":"direccion_revisar","rut":"run_rut_revisar"}[categorias[d["category"]][0]]
+                d["classification_basis"]="contexto_no_vinculado"; d["tarjar"]="revisar"
         if opuestas or any(d.get("classification_basis") == "titularidad_contradictoria" for d in grupo):
             # Ante conflicto no reafirmar automáticamente una categoría personal.
             if semillas:
                 for d in grupo:
-                    if categorias[d["category"]][1] != "no" or "consistencia_documental" in d.get("sources", []):
+                    if categorias[d["category"]][1] is None or "consistencia_documental" in d.get("sources", []):
                         d["tarjar"] = "revisar"
                         d["classification_basis"] = "conflicto_contextual_documental"
             continue
@@ -1484,17 +1627,17 @@ def consolidar_menores(detecciones):
     for d in detecciones:
         if d['category'] not in {'persona','persona_revisar','persona_menor','persona_funcionario'}: continue
         k=' '.join(fold(d['text']).split())
-        if len(k.split())<2: continue
+        if not nombre_plausible(d['text']): continue
         groups.setdefault((d['source_file'],k),[]).append(d)
     for group in groups.values():
-        seeds=[d for d in group if d['category']=='persona_menor' and d.get('classification_basis')=='menor_explicito' and d.get('tarjar')=='si']
+        seeds=[d for d in group if d['category']=='persona_menor' and d.get('classification_basis') in {'menor_explicito','rotulo_tabla_explicito'} and d.get('tarjar')=='si']
         if not seeds: continue
         if any(d['category']=='persona_funcionario' for d in group):
             for d in group:
                 d['classification_basis']='conflicto_contextual_documental'
             continue
         for d in group:
-            if d['category'] in {'persona','persona_revisar','persona_menor'} and d.get('classification_basis')!='menor_explicito':
+            if d['category'] in {'persona','persona_revisar','persona_menor'} and d.get('classification_basis') not in {'menor_explicito','rotulo_tabla_explicito'}:
                 d.update(category='persona_menor', classification_basis='repeticion_menor_confirmada', owner_role='menor', owner_name=seeds[0]['text'], repetition_seed=seeds[0].get('entity_id'))
 
 
@@ -1517,6 +1660,9 @@ def resolver_conflictos_documento(detecciones):
     for group in by_line.values():
         kept=[]
         for d in group:
+            if d['category'] != 'identificador_administrativo' and any(x['category']=='identificador_administrativo' and x['start']<=d['start'] and d['end']<=x['end'] for x in group):
+                if d.get('classification_basis') not in {'rotulo_tabla_explicito','codigo_validacion_explicito','titular_natural_explicito'}:
+                    continue
             generic=[x for x in group if x is not d and x['start']<=d['start'] and d['end']<=x['end'] and d['category'] in _SPECIFIC.get(x['category'],set()) and x['tarjar']!='revisar' and d.get('classification_basis')!='titularidad_contradictoria']
             if generic:
                 for x in generic: x['flags'].append('hipotesis_generica_resuelta:'+d['category'])
@@ -1650,14 +1796,20 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
     for document_name in {p["source_file"] for p in OCR_PAGES_INTERNAL}:
         document_pages = [p for p in OCR_PAGES_INTERNAL if p["source_file"] == document_name]
         seeds = {fold(d["text"]): d for d in ALL_DETECTIONS
-                 if d["source_file"] == document_name and d.get("tarjar") != "no" and len(d["text"]) >= 4}
+                 if d["source_file"] == document_name and d.get("tarjar") == "si" and len(d["text"]) >= 4
+                 and d["category"] in {"run_rut_personal","correo_personal","telefono_personal","direccion_personal","persona_menor"}
+                 and (d["category"] != "persona_menor" or nombre_plausible(d["text"]))
+                 and "consistencia_documental" not in d.get("sources",[])}
         for page in document_pages:
             extra = []
             for block in page["blocks"]:
                 found = []
+                if block.get("table_label") or block.get("table_category"):
+                    extra.append(found); continue
                 for value, seed in seeds.items():
                     pattern = r"(?<!\w)" + r"\s+".join(re.escape(part) for part in value.split()) + r"(?!\w)"
                     for match in re.finditer(pattern, fold(block["text"])):
+                        if seed["category"] == "persona_menor" and refine_person(block["text"],match.start(),match.end())[0] != "persona": continue
                         found.append(mk(block["text"], match.start(), match.end(), seed["category"],
                                         seed["score"], ["consistencia_documental"], "revisar_contexto_repeticion"))
                 extra.append(found)
@@ -1665,7 +1817,7 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
                         if d["source_file"] == document_name and d["page"] == page["page"]}
             for d in build_detections(page, page["blocks"], extra):
                 key = (d["line_index"], d["start"], d["end"], d["category"])
-                if key not in existing:
+                if key not in existing and not any(li==d["line_index"] and a<=d["start"] and d["end"]<=b for li,a,b,c in existing):
                     d["tarjar"] = "revisar"
                     d["tipo_acto"] = tipos_documento[document_name]["tipo"]
                     d["entity_id"] += "-repeticion"
