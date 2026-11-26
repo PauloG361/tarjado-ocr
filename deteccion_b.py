@@ -3,11 +3,12 @@ import argparse
 import re
 import json
 import hashlib
+import math
 import traceback
 import unicodedata
 import html as _html
 from pathlib import Path
-from reglas import aplicar, candidatos_adicionales, VERSION as RULES_VERSION
+from reglas import aplicar, politica, candidatos_adicionales, VERSION as RULES_VERSION
 from ocr_a import ejecutar_etapa
 
 ner_model = None
@@ -40,6 +41,13 @@ GLINER_PASSES = {
         "bank account number": "dato_financiero",
         "health insurance number": "dato_previsional",
         "medical condition": "dato_salud",
+        "medical treatment": "dato_salud",
+        "disability": "dato_salud",
+        "health insurance provider": "dato_salud",
+        "bank balance": "dato_financiero",
+        "personal income": "dato_financiero",
+        "pension fund": "dato_previsional",
+        "pension contribution": "dato_previsional",
         "phone number": "telefono",
         "mobile phone number": "telefono",
     },
@@ -48,6 +56,8 @@ GLINER_PASSES = {
         "property boundary": "deslindes",
         "military facility name": "recinto",
         "profession": "dato_pendiente",
+        "age": "dato_menor_revisar",
+        "school name": "dato_menor_revisar",
     },
 }
 
@@ -63,6 +73,10 @@ GLINER_THRESHOLDS = {   # umbral por etiqueta (no son comparables entre sí)
     "date of birth": 0.35, "bank account number": 0.40, "health insurance number": 0.40,
     "medical condition": 0.40, "phone number": 0.40, "mobile phone number": 0.40,
 }
+
+for _label in ("medical treatment", "disability", "health insurance provider", "bank balance",
+               "personal income", "pension fund", "pension contribution", "age", "school name"):
+    GLINER_THRESHOLDS[_label] = 0.40
 
 GLINER_MIN_THRESHOLD = min(GLINER_THRESHOLDS.values())
 
@@ -93,32 +107,6 @@ PROPAGATE_MIN_SCORE = 0.55
 PROPAGAR_VARIANTES = True          # primer+segundo, último+penúltimo y primero+último de nombres de >= 3 palabras
 
 PROPAGAR_TOKENS_SUELTOS = False    # propagar palabras sueltas (apellidos) como persona_revisar
-
-POLITICA = {
-    "persona": "no",
-    "persona_revisar": "revisar",
-    "direccion_personal": "si",
-    "direccion_revisar": "revisar",
-    "direccion_inmueble": "no",        # PENDIENTE de criterio
-    "direccion_institucional": "no",        # confirmado: no se tarja
-    "correo_personal": "si",
-    "correo_institucional": "no",      # PENDIENTE de criterio
-    "correo_revisar": "revisar",
-    "run_rut": "revisar",
-    "run_rut_personal": "si",
-    "run_rut_juridico": "no",
-    "codigo_validacion": "si",
-    "run_rut_revisar": "revisar",
-    "telefono_personal": "si",
-    "telefono_institucional": "no",
-    "telefono_revisar": "revisar",
-    "estado_civil": "si",
-    "fecha_nacimiento": "si",          # solo con cue de nacimiento (RNA-06)
-    # RNA-05: financiero / previsional / salud. Quedan en "revisar" hasta medir la precisión de GLiNER; luego pasar a "si".
-    "dato_financiero": "revisar",
-    "dato_previsional": "revisar",
-    "dato_salud": "revisar",
-}
 
 SHOW_NO_IN_REVIEW = True
 
@@ -264,18 +252,18 @@ def find_emails(text):
 
 def classify_email(value, fmasked, s, e):
     domain = re.sub(r"\s+", "", value.split("@")[-1]).lower()
-    if _domain_matches(domain, PERSONAL_EMAIL_DOMAINS):
-        return "correo_personal", "dominio_personal"
-    if _domain_matches(domain, INSTITUTIONAL_EMAIL_DOMAINS):
-        return "correo_institucional", "dominio_institucional"
     kind = nearest_group(fmasked, s, e, CUES_EMAIL, CUE_MAX_DISTANCE)
     if kind == "personal":
         return "correo_personal", "contexto"
     if kind == "institucional":
         return "correo_institucional", "contexto"
+    if _domain_matches(domain, PERSONAL_EMAIL_DOMAINS):
+        return "correo_revisar", "dominio_personal_sin_titular"
+    if _domain_matches(domain, INSTITUTIONAL_EMAIL_DOMAINS):
+        return "correo_institucional", "dominio_institucional"
     return "correo_revisar", "sin_evidencia"
 
-RUT_RE = re.compile(r"(?<![\w.,])(\d{1,2}(?:[.,]\d{3}){2}|\d{7,8})\s*-?\s*([\dkK])(?![\w])")
+RUT_RE = re.compile(r"(?<![\w.,])(\d{1,2}(?:[.,]\d{3}){2}|\d{7,8})\s*[-–—]?\s*([\dkK])(?![\w])")
 
 def _rut_dv(body):
     total, mult = 0, 2
@@ -292,7 +280,7 @@ RUT_TITULAR_RE = re.compile(
     r"\s*(?P<owner>(?:d(?:e|el)\s+)?(?:la\s+|el\s+)?"
     r"(?:persona\s+natural|persona\s+juridica|representante(?:\s+legal)?|"
     r"empresa|sociedad|corporacion|fundacion|personal|particular))?"
-    r"\s*(?:n[°ºo.]?\s*)?[:=]?\s*$"
+    r"\s*(?:(?:n[°ºo.]|numero)\s*)?[:=]?\s*$"
 )
 RUT_OWNER_PUBLIC = {"empresa", "sociedad", "persona juridica", "corporacion", "fundacion"}
 RUT_OWNER_PRIVATE = {"representante", "representante legal", "persona natural", "personal", "particular"}
@@ -467,7 +455,7 @@ ESTADO_CIVIL_RE = re.compile(
     r"casado|casada|"
     r"divorciado|divorciada|"
     r"viudo|viuda|"
-    r"conviviente"
+    r"conviviente\s+civil|conviviente|separado|separada"
     r")\b"
 )
 
@@ -606,21 +594,238 @@ def _trim(text, s, e):
         e -= 1
     return s, e
 
-def _prio(cat):
-    if cat.startswith(("run_rut", "correo", "telefono", "fecha_nacimiento")):
-        return 3
-    if cat.startswith(("direccion", "dato_")):
-        return 2
-    return 1
+# Los candidatos genéricos no deben duplicar un candidato contextual del mismo dato.
+_SPECIFIC = {
+    "run_rut_personal": {"run_rut", "run_rut_revisar"}, "run_rut_juridico": {"run_rut", "run_rut_revisar"},
+    "persona_menor": {"persona", "persona_revisar"}, "persona_funcionario": {"persona", "persona_revisar"},
+    "direccion_personal": {"direccion_revisar"}, "direccion_inmueble": {"direccion_revisar"},
+    "direccion_institucional": {"direccion_revisar"}, "correo_personal": {"correo_revisar"},
+    "correo_institucional": {"correo_revisar"}, "telefono_personal": {"telefono_revisar"},
+    "telefono_institucional": {"telefono_revisar"}, "nacionalidad_personal": {"nacionalidad"},
+    "dato_financiero_personal": {"dato_financiero"}, "dato_previsional_personal": {"dato_previsional"},
+    "dato_salud_personal": {"dato_salud"}, "dato_menor": {"dato_menor_revisar"},
+    "codigo_validacion": {"codigo_validacion_revisar"},
+}
+
 
 def resolve_overlaps(ents):
-    # Conservar hipótesis superpuestas para decisión humana (no perder reservas).
     unique = {}
     for x in ents:
         key = (x["s"], x["e"], x["category"])
-        if key not in unique or x["score"] > unique[key]["score"]:
+        if key not in unique:
             unique[key] = x
-    return sorted(unique.values(), key=lambda x: x["s"])
+        else:
+            old = unique[key]
+            # Preferir evidencia contextual, no solo el puntaje arbitrario.
+            chosen, other = (x,old) if (bool(x.get("owner")),x["basis"]!="solo_gliner",x["score"]) > (bool(old.get("owner")),old["basis"]!="solo_gliner",old["score"]) else (old,x)
+            chosen["sources"] = sorted(set(chosen["sources"]+other["sources"]))
+            chosen["flags"] = sorted(set(chosen["flags"]+other["flags"]))
+            unique[key] = chosen
+    vals=list(unique.values()); keep=[]
+    for x in vals:
+        winners=[y for y in vals if y is not x and y["s"]<=x["s"] and x["e"]<=y["e"] and x["category"] in _SPECIFIC.get(y["category"],set()) and x["basis"]!="titularidad_contradictoria"]
+        if winners:
+            for y in winners: y["flags"].append("hipotesis_generica_resuelta:"+x["category"])
+            continue
+        # Si dos candidatos de igual categoría están contenidos, preservar el tramo más largo
+        # solo cuando cuenta con evidencia explícita (p. ej. domicilio con localidad).
+        wider=[y for y in vals if y is not x and y["category"]==x["category"] and y["s"]<=x["s"] and x["e"]<=y["e"] and (y["s"],y["e"])!=(x["s"],x["e"]) and y["basis"] in {"domicilio_explicito","ubicacion_inmueble_explicita","dato_sensible_contextual","url_validacion_explicita"}]
+        if wider: continue
+        keep.append(x)
+    return sorted(keep,key=lambda x:(x["s"],x["e"],x["category"]))
+
+
+# Contexto local: se limita a cláusulas; no se infiere titularidad por un apellido aislado.
+_PUBLIC_ROLE = r"(?:ministro|ministra|subsecretari[oa]|secretari[oa]\s+regional\s+ministerial|seremi|alcalde|alcaldesa|director(?:a)?\s+(?:regional|nacional)|funcionari[oa]\s+public[oa]|jefe\s+de\s+(?:division|departamento|unidad))"
+_PERSON_ROLE = r"(?:arrendatari[oa]|solicitante|beneficiari[oa]|representante\s+legal|compareciente|titular|persona\s+natural)"
+# Mayúsculas de origen (incluye documentos completamente en mayúsculas), hasta cinco palabras.
+_NAME_WORD = r"[A-ZÁÉÍÓÚÜÑ][a-záéíóúüñA-ZÁÉÍÓÚÜÑ'-]{1,30}"
+_NAME = rf"{_NAME_WORD}(?:[ \t]+(?:(?:de|del|la|las|los|y)[ \t]+)?{_NAME_WORD}){{1,4}}"
+_NAME_CUE = re.compile(rf"(?i:\b(?:don|doña|dona|sr\.?|sra\.?|menor(?:\s+de\s+edad)?|niñ[oa]|adolescente|{_PERSON_ROLE}|{_PUBLIC_ROLE})\s*[:：]?\s+)(?P<name>{_NAME})")
+_AGE = re.compile(r"\b(?P<age>\d{1,2}\s+anos(?:\s+de\s+edad)?)\b")
+_MINOR_CUE = re.compile(r"\b(?:menor(?:\s+de\s+edad)?|nina|nino|adolescente)\b")
+_BOUNDARY = re.compile(r";|\n\s*\n|(?<=[.!?])\s+(?=[A-ZÁÉÍÓÚÑ])")
+_ORG_SUFFIX = re.compile(r"\b(?:spa|ltda|s\.a\.|eirl|empresa|sociedad|fundacion|corporacion)\b")
+_PUBLIC_FIELD = re.compile(r"\b(?:inmueble|predio|terreno|arriendo|canon|renta\s+de\s+arriendo|precio\s+del\s+inmueble|monto\s+adeudado|garantia|expediente|oficio|decreto|resolucion)\b")
+_CONTACT_CUE = {
+    "correo": re.compile(r"\b(?:correo(?:\s+electronico)?|email|e-mail|mail)\s*(?:de\s+contacto)?\s*[:：]?\s*$"),
+    "telefono": re.compile(r"\b(?:telefono|celular|fono|movil|whatsapp|contacto)\s*[:：]?\s*$"),
+    "direccion": re.compile(r"\b(?:domicilio(?:\s+particular)?|domiciliad[oa]|reside|vive|direccion\s+particular)\s*(?:en\s+)?[:：]?\s*$"),
+}
+_NATIONALITY = r"(?:chilen[oa]|argentin[oa]|peruan[oa]|bolivian[oa]|colombian[oa]|venezolan[oa]|ecuatorian[oa]|brasilen[oa]|uruguay[oa]|paraguay[oa]|mexican[oa]|espanol[ae]?|espanola|frances[ae]?|italian[oa]|alemana?|estadounidense|canadiense|haitian[oa]|cuban[oa]|dominican[oa]|chin[oa]|japones[ae]?|extranjer[oa])"
+# Capturar solo el valor; no la etiqueta ni datos de otra cláusula.
+_CONTEXT_FIELDS = [
+    ("dato_financiero_personal", r"\b(?:cuenta\s+(?:bancaria|corriente|vista|de\s+ahorro)|cuenta\s+rut)\s*(?:n[°ºo.]\s*)?[:：]?\s*(?P<v>\d[\d. -]{3,24}\d)(?!\d)"),
+    ("dato_financiero_personal", r"\b(?:saldo\s+(?:bancario|de\s+(?:su\s+)?cuenta)|saldo\s+personal|ingreso\s+mensual\s+personal|sueldo\s+personal)\s*(?:de\s+)?[:：]?\s*(?P<v>\$\s*\d[\d.,]*)"),
+    ("dato_previsional_personal", r"\b(?:afiliad[oa]\s+a\s+|afiliacion\s+(?:previsional\s+)?(?:a\s+)?|prevision\s*[:：]\s*)?(?P<v>afp\s+[a-z][a-z0-9-]*(?:\s+(?:capital|habitat|modelo|planvital|provida|cuprum|uno))?)\b"),
+    ("dato_previsional_personal", r"\b(?:cotizacion(?:es)?\s+previsional(?:es)?|cotizacion(?:es)?\s+(?:de\s+)?afp)\s*[:：]?\s*(?P<v>\$\s*\d[\d.,]*|\d+(?:[.,]\d+)?\s*%)"),
+    ("dato_salud_personal", r"\b(?:afiliad[oa]\s+a\s+|sistema\s+de\s+salud\s*[:：]\s*|prevision\s+de\s+salud\s*[:：]\s*)?(?P<v>fonasa(?:\s+tramo\s+[abcd])?|isapre\s+[a-z]+)\b"),
+    ("dato_salud_personal", r"\b(?:diagnostico(?:\s+medico)?|enfermedad|patologia|condicion\s+medica|tratamiento\s+medico|discapacidad)\s*[:：]\s*(?P<v>[^;\n,.]{2,65})"),
+    ("dato_salud_personal", r"\b(?:padece|diagnosticad[oa]\s+con|sufre\s+de)\s+(?P<v>[^;\n,.]{2,65})"),
+    ("dato_salud_personal", r"\b(?P<v>diabetes(?:\s+(?:mellitus\s+)?tipo\s+[12])?|hipertension\s+arterial|discapacidad\s+(?:fisica|visual|auditiva|intelectual|psicosocial))\b"),
+]
+
+
+def _clause(text, s, e):
+    """Límites originales, sin cruzar fin de oración ni bloque."""
+    a, b = 0, len(text)
+    for m in _BOUNDARY.finditer(text):
+        if m.end() <= s:
+            a = m.end()
+        elif m.start() >= e:
+            b = m.start(); break
+    return a, b
+
+
+def _add_candidate(ents, text, s, e, cat, basis, score=.9, owner=None):
+    s, e = _trim(text, s, e)
+    if e <= s:
+        return
+    x = mk(text, s, e, cat, score, ["regla_contextual"], basis)
+    if owner:
+        x["owner"] = owner["text"]
+        x["owner_role"] = owner.get("role", "natural")
+    ents.append(x)
+
+
+def contextualizar(text, ents, role=""):
+    """Relaciona candidatos en una cláusula. Evidencia débil queda en revisión."""
+    f = fold(text)
+    # Aumentar recall de nombres con roles explícitos aunque GLiNER no los encuentre.
+    for m in _NAME_CUE.finditer(text):
+        s, e = m.span("name")
+        # No incluir RUN/RUT, siglas administrativas o cargo en el nombre.
+        stop = re.search(r"\s+(?:RUN|RUT|CEDULA|CÉDULA|DECRETO|RESOLUCION|RESOLUCIÓN|NACIONALIDAD|DOMICILIO|SECRETARIA|SECRETARIO|MINISTRA|MINISTRO)\b", text[s:e], re.I)
+        if stop: e = s + stop.start()
+        if len(text[s:e].split()) < 2 or not text[s:e].strip(): continue
+        if not any(x["category"].startswith("persona") and _ov(s,e,x["s"],x["e"]) for x in ents):
+            cat, s, e, _, flags = refine_person(text, s, e)
+            if cat == "persona": _add_candidate(ents,text,s,e,"persona","nombre_con_rol",.85)
+    people = sorted([x for x in ents if x["category"] in {"persona", "persona_revisar"}], key=lambda x:(x["s"],-x["e"]))
+    # Solo una hipótesis de nombre por tramo para asociar titularidad.
+    owners = []
+    for p in people:
+        if any(_ov(p["s"],p["e"],q["s"],q["e"]) for q in owners): continue
+        if len(p["text"].split()) < 2 or _ORG_SUFFIX.search(fold(p["text"])): continue
+        a,b = _clause(text,p["s"],p["e"])
+        left, right = f[max(a,p["s"]-85):p["s"]],f[p["e"]:min(b,p["e"]+90)]
+        public = bool(re.search(rf"\b{_PUBLIC_ROLE}\s*[:,]?\s*$",left) or re.match(rf"\s*[,(-]?\s*{_PUBLIC_ROLE}\b",right))
+        # También firma en línea siguiente: nombre seguido inmediatamente de cargo público explícito.
+        public |= bool(re.match(rf"[ \t]*\n[ \t]*{_PUBLIC_ROLE}\b",f[p["e"]:p["e"]+95]))
+        if public and _ORG_SUFFIX.search(left+" "+right): public=False
+        minor = bool(re.search(r"\b(?:menor(?:\s+de\s+edad)?|nina|nino|adolescente)\s*[:,]?\s*$",left))
+        age = re.match(r"\s*,?\s*(?:de\s+)?(\d{1,2})\s+anos\b",right)
+        minor |= bool(age and int(age.group(1)) < 18 and not public)
+        # Edad puede ir después del RUN inmediatamente asociado.
+        age_after_rut = re.match(r"\s*,?\s*(?:run|rut)\s*[:：]?\s*[\d.,-]+[kK]?\s*,?\s*(?:de\s+)?(\d{1,2})\s+anos\b",right)
+        minor |= bool(age_after_rut and int(age_after_rut.group(1)) < 18)
+        p["role"] = "ambiguo" if public and minor else "menor" if minor else "funcionario" if public else "natural"
+        p["owner"] = p["text"]; p["owner_role"] = p["role"]
+        if p["role"] == "menor": p.update(category="persona_menor",basis="menor_explicito")
+        elif p["role"] == "funcionario": p.update(category="persona_funcionario",basis="cargo_publico_explicito")
+        owners.append(p)
+
+    def owner_for(s,e):
+        a,b = _clause(text,s,e)
+        prev = [p for p in owners if a <= p["s"] and p["e"] <= s and s-p["e"] <= 180]
+        if not prev: return None
+        p = max(prev,key=lambda q:q["e"])
+        between = f[p["e"]:s]
+        if "table" in str(role).lower() and "\n" in between: return None
+        if _ORG_SUFFIX.search(between) or re.search(r"\b(?:otra\s+persona|representad[oa]\s+por|inmueble\s+fiscal|predio\s+fiscal|expediente|resolucion|decreto)\b",between): return None
+        return p if p["role"] != "ambiguo" else None
+
+    for x in list(ents):
+        s,e,cat = x["s"],x["e"],x["category"]
+        a,b = _clause(text,s,e); left=f[max(a,s-100):s]
+        owner=owner_for(s,e)
+        if owner and cat.startswith(("run_rut", "correo", "telefono", "direccion", "dato_", "fecha_nacimiento", "estado_civil", "nacionalidad")):
+            x["owner"], x["owner_role"] = owner["text"],owner["role"]
+        if cat == "run_rut_revisar" and owner and x["basis"] != "titularidad_contradictoria":
+            if re.search(r"\b(?:rut|run|cedula(?:\s+de\s+identidad)?)\s*(?:n[°ºo.]\s*)?[:：]?\s*$",left) and not _ORG_SUFFIX.search(f[owner["e"]:s]):
+                # Rango jurídico contradictorio con el nombre requiere revisión, no decisión automática.
+                key=clave_rut(x["text"])
+                if key[:-1].isdigit() and 0<int(key[:-1])<30000000:
+                    x.update(category="run_rut_personal",basis="rut_asociado_nombre")
+        elif cat.startswith(("correo_","telefono_","direccion_")):
+            family=cat.split("_")[0]
+            groups={"correo":CUES_EMAIL,"telefono":CUES_PHONE,"direccion":CUES_ADDRESS}[family]
+            # Una indicación explícita próxima prevalece sobre el dominio.
+            local=f[max(a,s-75):s]
+            explicit = next((kind for kind,patterns in groups.items() if any(re.search(rx.pattern+r"\s*[:：]?\s*$",local) for rx in patterns)),None)
+            if family == "direccion":
+                # Un domicilio explícito vence los términos generales del inmueble.
+                if _CONTACT_CUE[family].search(local): explicit="personal"
+                elif re.search(r"\b(?:inmueble|predio|terreno|propiedad\s+fiscal)\b[^;]{0,40}\b(?:ubicad[oa]|direccion)\s*(?:en\s+)?[:：]?\s*$",local): explicit="inmueble"
+            if explicit:
+                x.update(category=family+"_"+explicit,basis="contexto_local_explicito")
+            elif owner and _CONTACT_CUE[family].search(local) and cat not in {family+"_institucional",family+"_inmueble"}:
+                # Contacto genérico de funcionario no es necesariamente privado.
+                if owner["role"] in {"natural","menor"}:
+                    x.update(category=family+"_personal",basis="contacto_asociado_nombre")
+            elif x["basis"]=="contexto" and cat.endswith("_personal"):
+                x.update(category=family+"_revisar",basis="contexto_no_vinculado")
+        elif cat == "estado_civil" and not (owner or re.search(r"\b(?:estado\s+civil|de\s+estado\s+civil)\s*[:：]?\s*$",left)):
+            x.update(category="estado_civil_revisar",basis="estado_civil_sin_titular")
+        elif cat == "nacionalidad" and (owner or re.search(r"\bnacionalidad\s*[:：]?\s*$",left)) and re.fullmatch(_NATIONALITY,fold(x["text"])):
+            x.update(category="nacionalidad_personal",basis="nacionalidad_contextual")
+
+    for m in re.finditer(rf"\b(?P<v>{_NATIONALITY})\b",f):
+        s,e=m.span("v"); a,_=_clause(text,s,e); left=f[max(a,s-60):s]; owner=owner_for(s,e)
+        explicit=bool(re.search(r"\b(?:de\s+)?nacionalidad\s*[:：]?\s*$",left))
+        attached=bool(owner and re.fullmatch(r"\s*,?\s*",f[owner["e"]:s]))
+        if explicit or attached: _add_candidate(ents,text,s,e,"nacionalidad_personal","nacionalidad_contextual",owner=owner)
+        elif owner: _add_candidate(ents,text,s,e,"nacionalidad","gentilicio_sin_vinculo_claro",.6,owner)
+    # Una nacionalidad explícita fuera de la lista no se pierde: queda pendiente.
+    for m in re.finditer(r"\bnacionalidad\s*[:：]?\s*(?P<v>[a-z][a-z-]{2,35})\b",f):
+        s,e=m.span("v")
+        if f[s:e] not in {"de","del","persona","empresa","sociedad","no","sin","desconocida"} and not re.fullmatch(_NATIONALITY,f[s:e]):
+            _add_candidate(ents,text,s,e,"nacionalidad","nacionalidad_fuera_diccionario",.65,owner_for(s,e))
+    # Direcciones rurales / sin número, únicamente tras un rótulo inequívoco.
+    for m in re.finditer(r"\b(?:domicilio(?:\s+particular)?|domiciliad[oa]|reside)\s*(?:en\s+|[:：]\s*)(?P<v>[^;\n,.]{4,90}(?:,\s*(?:villa|poblacion|sector|comuna|departamento|depto\.?|casa)\s+[^;\n,.]{1,40})?)",f):
+        s,e=m.span("v"); val=f[s:e]
+        if re.search(r"\b(?:calle|pasaje|camino|ruta|sector|parcela|villa|poblacion|avenida|avda|s/n|sin\s+numero)\b",val):
+            # Cortar antes de otros campos y no invadir contenido de un acto.
+            cut=re.search(r"\s+(?:rut|run|correo|telefono|nacionalidad|estado\s+civil|inmueble\s+fiscal)\b",val)
+            if cut:e=s+cut.start()
+            _add_candidate(ents,text,s,e,"direccion_personal","domicilio_explicito",owner=owner_for(s,e))
+    for m in re.finditer(r"\b(?:inmueble|predio|terreno|propiedad\s+fiscal)\b[^;\n,.]{0,40}\b(?:ubicad[oa]\s+en|direccion\s*[:：])\s*(?P<v>[^;\n,.]{4,90}(?:,\s*(?:villa|poblacion|sector|comuna)\s+[^;\n,.]{1,40})?)", f):
+        s,e=m.span("v")
+        if re.search(r"\b(?:calle|pasaje|camino|ruta|sector|parcela|villa|poblacion|avenida|avda)\b",f[s:e]):
+            _add_candidate(ents,text,s,e,"direccion_inmueble","ubicacion_inmueble_explicita")
+    if re.search(r"\bdeslinde[s]?\b",f) or len(re.findall(r"\b(?:norte|sur|este|oeste|oriente|poniente)\s*:",f))>=2:
+        for m in re.finditer(r"\b(?:norte|sur|este|oeste|oriente|poniente)\s*:\s*(?P<v>[^;\n]{2,100}?)(?=;|\n|$|\s+(?:norte|sur|este|oeste|oriente|poniente)\s*:)",f):
+            _add_candidate(ents,text,*m.span("v"),"deslindes","deslinde_explicito")
+    for m in re.finditer(r"\b(?:rol\s+(?:de\s+)?avaluo|inscripcion\s+conservatoria)\s*[:：]?\s*(?P<v>[^;\n,.]{2,50})",f):
+        _add_candidate(ents,text,*m.span("v"),"ubicacion_inmueble_revisar","definicion_pendiente_rna09")
+    for cat,pat in _CONTEXT_FIELDS:
+        for m in re.finditer(pat,f):
+            s,e=m.span("v"); owner=owner_for(s,e); a,_=_clause(text,s,e); prefix=f[max(a,m.start()-65):m.start()]
+            cut=re.search(r"\s+(?:y\s+)?(?:rut|run|correo|telefono|nacionalidad|domicilio|inmueble|expediente|resolucion|decreto|cotizacion|saldo)\b",f[s:e])
+            if cut:e=s+cut.start()
+            # Sin un titular, una etiqueta de AFP/diagnóstico puede referir a una institución o norma.
+            explicit=bool(re.search(r"\b(?:personal|particular|su|del\s+titular|del\s+solicitante|del\s+representante)\b",prefix+" "+f[m.start():s]))
+            if cat=="dato_financiero_personal" and _PUBLIC_FIELD.search(prefix) and not explicit: owner=None
+            if owner and owner["role"]=="funcionario" and not explicit: owner=None
+            if owner or explicit:
+                target=cat
+            else: target=cat.removesuffix("_personal")
+            _add_candidate(ents,text,s,e,target,"dato_sensible_contextual" if target==cat else "sensible_sin_titular",.9 if target==cat else .65,owner)
+    # Edad y establecimiento del menor: solo vínculo local comprobado, o etiqueta explícita.
+    for m in _AGE.finditer(f):
+        s,e=m.span("age"); owner=owner_for(s,e)
+        n=int(re.match(r"\d+",f[s:e]).group())
+        if n<18 and owner and owner["role"]=="menor": _add_candidate(ents,text,s,e,"dato_menor","edad_menor_explicita",owner=owner)
+        elif n<18 and _MINOR_CUE.search(f[max(0,s-45):s]): _add_candidate(ents,text,s,e,"dato_menor_revisar","edad_menor_sin_nombre",.7)
+    for m in re.finditer(r"\b(?:estudia\s+en|asiste\s+a|establecimiento\s+educacional\s*[:：]|colegio\s*[:：])\s*(?P<v>[^;\n,.]{3,70})",f):
+        s,e=m.span("v"); owner=owner_for(s,e)
+        if owner and owner["role"]=="menor": _add_candidate(ents,text,s,e,"dato_menor","establecimiento_menor",owner=owner)
+        elif _MINOR_CUE.search(f[max(0,s-100):s]): _add_candidate(ents,text,s,e,"dato_menor_revisar","establecimiento_sin_titular",.7)
+    for m in re.finditer(r"https?://[^\s<>;,]+",text,re.I):
+        if re.search(r"(?:validar|validacion|verificar|verificacion)",fold(m.group())):
+            _add_candidate(ents,text,m.start(),m.end(),"vinculo_validacion","url_validacion_explicita")
+    return ents
+
 
 def detect_block(block, gl_ents, es_ents):
     text = block["text"]
@@ -702,12 +907,8 @@ def detect_block(block, gl_ents, es_ents):
             else:
                 ents.append(mk(text, s, e, "ignorar:fecha", score, ["gliner"], "fecha_sin_cue_nacimiento"))
         elif kind in ("dato_financiero", "dato_previsional"):
-            digits = re.sub(r"\D", "", text[s:e])
-            left = ftext[max(0, s - 25):s]
-            if (len(digits) < ID_MIN_DIGITS or NON_ID_CONTEXT_RE.search(left)
-                    or _overlaps_any(s, e, regex_spans)):
-                continue
-            ents.append(mk(text, s, e, kind, score * 0.8, ["gliner"], "solo_gliner"))
+            if not _overlaps_any(s, e, regex_spans) and not NON_ID_CONTEXT_RE.search(ftext[max(0,s-25):s]):
+                ents.append(mk(text,s,e,kind,score * 0.8,["gliner"],"solo_gliner"))
         elif kind == "dato_salud":
             if not _overlaps_any(s, e, regex_spans):
                 ents.append(mk(text, s, e, "dato_salud", score * 0.8, ["gliner"], "solo_gliner"))
@@ -718,8 +919,9 @@ def detect_block(block, gl_ents, es_ents):
             if (8 <= len(digits) <= 11 and not DATE_RE.match(st) and not RUT_DOTTED_RE.match(st)
                     and not NON_ID_CONTEXT_RE.search(left) and not _overlaps_any(s, e, regex_spans)):
                 ents.append(mk(text, s, e, "telefono_revisar", score * 0.8, ["gliner"], "solo_gliner"))
-        elif kind in {"nacionalidad", "deslindes", "recinto", "dato_pendiente"}:
-            ents.append(mk(text, s, e, kind, score, ["gliner"], "requiere_confirmacion"))
+        elif kind in {"nacionalidad", "deslindes", "recinto", "dato_pendiente", "dato_menor_revisar"}:
+            if kind != "dato_menor_revisar" or re.search(r"\b(?:menor|nino|nina|adolescente|\d{1,2}\s+anos)\b",ftext[max(0,s-100):e+100]):
+                ents.append(mk(text, s, e, kind, score, ["gliner"], "requiere_confirmacion"))
         elif kind.startswith("ignorar:"):
             ents.append(mk(text, s, e, kind, score, ["gliner"], "gliner"))
 
@@ -769,7 +971,7 @@ def detect_block(block, gl_ents, es_ents):
             cat = "codigo_validacion_revisar"
         basis = "codigo_validacion_explicito" if cat == "codigo_validacion" else "requiere_confirmacion"
         ents.append(mk(text, s, e, cat, 0.95 if cat == "codigo_validacion" else 0.5, ["regla_contextual"], basis))
-    return resolve_overlaps(ents)
+    return resolve_overlaps(contextualizar(text, ents, block.get("role", "")))
 
 STOP_TOKENS = {"de", "del", "la", "las", "los", "el", "y", "e", "da", "do", "van", "von"}
 
@@ -834,57 +1036,40 @@ def to_fragments(block, s, e):
     return frags
 
 def geometry_for_span(line, start, end):
-    """
-    Recupera polígonos originales de palabras que se cruzan con [start, end).
-    Cuando no hay geometría de palabra, usa cajas por carácter si existen.
-    Como último recurso devuelve el polígono/caja de línea y marca la aproximación.
-    """
-    selected_polygons = []
-    selected_boxes = []
-    covered = set()
-
-    for word in line.get("words", []):
-        if int(word.get("start", 0)) < end and start < int(word.get("end", 0)):
-            poly = word.get("polygon")
-            if poly:
-                covered.update(range(max(start, int(word["start"])), min(end, int(word["end"]))))
-                selected_polygons.append([[float(p[0]), float(p[1])] for p in poly])
-                box = word.get("bbox_xyxy")
-                if box:
-                    selected_boxes.append([float(v) for v in box])
-
-    required = {i for i in range(start, end) if not line["text"][i].isspace()}
-    if selected_polygons and required <= covered:
-        if selected_boxes:
-            bbox = [min(b[0] for b in selected_boxes), min(b[1] for b in selected_boxes),
-                    max(b[2] for b in selected_boxes), max(b[3] for b in selected_boxes)]
-        else:
-            pts = [p for poly in selected_polygons for p in poly]
-            bbox = [min(p[0] for p in pts), min(p[1] for p in pts),
-                    max(p[0] for p in pts), max(p[1] for p in pts)]
-        return bbox, "word_polygons", selected_polygons
-
-    cb = line.get("char_boxes")
-    if cb:
-        sel = [b for b in cb[start:end] if b is not None]
-        if sel and len(cb) >= end and all(cb[i] is not None for i in required):
-            bbox = [min(b[0] for b in sel), min(b[1] for b in sel),
-                    max(b[2] for b in sel), max(b[3] for b in sel)]
-            x0, y0, x1, y1 = bbox
-            poly = [[x0,y0],[x1,y0],[x1,y1],[x0,y1]]
-            return bbox, "character_boxes_union", [poly]
-
+    """Caracteres exactos primero; nunca autorizar una palabra cortada sin cajas precisas."""
+    required = {i for i in range(start,end) if not line["text"][i].isspace()}
+    def valid_box(b):
+        return (isinstance(b,(tuple,list)) and len(b)==4 and all(isinstance(v,(int,float)) and math.isfinite(v) for v in b)
+                and b[0]<b[2] and b[1]<b[3])
+    def union(boxes):
+        return [min(b[0] for b in boxes),min(b[1] for b in boxes),max(b[2] for b in boxes),max(b[3] for b in boxes)]
+    def rectangle(b):
+        x0,y0,x1,y1=b
+        return [[[x0,y0],[x1,y0],[x1,y1],[x0,y1]]]
+    cb=line.get("char_boxes") or []
+    if required and len(cb)>=end and all(valid_box(cb[i]) for i in required):
+        boxes=[cb[i] for i in sorted(required)]
+        # No aprobar cajas compartidas por caracteres públicos y reservados.
+        outside=[cb[i] for i in range(min(len(cb),len(line["text"]))) if i not in required and not line["text"][i].isspace() and valid_box(cb[i])]
+        box=union(boxes)
+        if not any(box[0]<b[2] and b[0]<box[2] and box[1]<b[3] and b[1]<box[3] for b in outside):
+            return box,"character_boxes_union",rectangle(box)
+    polygons=[]; covered=set(); partial=False
+    for word in line.get("words",[]):
+        a,b=int(word.get("start",0)),int(word.get("end",0)); poly=word.get("polygon")
+        if not poly or not (a<end and start<b): continue
+        polygons.append(poly); covered.update(range(max(start,a),min(end,b)))
+        if any(not line["text"][i].isspace() for i in range(max(0,a),min(b,len(line["text"]))) if not start<=i<end): partial=True
+    if polygons and required and required<=covered:
+        pts=[q for poly in polygons for q in poly]
+        box=[min(q[0] for q in pts),min(q[1] for q in pts),max(q[0] for q in pts),max(q[1] for q in pts)]
+        return box,"partial_word_approximation" if partial else "word_polygons",polygons
     if line.get("polygon"):
-        poly = [[float(p[0]), float(p[1])] for p in line["polygon"]]
-        pts = poly
-        bbox = [min(p[0] for p in pts), min(p[1] for p in pts),
-                max(p[0] for p in pts), max(p[1] for p in pts)]
-        return bbox, "line_polygon_approximation", [poly]
-    if line.get("bbox"):
-        bbox = list(map(float, line["bbox"]))
-        x0, y0, x1, y1 = bbox
-        return bbox, "line_bbox_approximation", [[[x0,y0],[x1,y0],[x1,y1],[x0,y1]]]
-    return None, "no_coordinates", []
+        poly=line["polygon"]; box=[min(q[0] for q in poly),min(q[1] for q in poly),max(q[0] for q in poly),max(q[1] for q in poly)]
+        return box,"line_polygon_approximation",[poly]
+    if valid_box(line.get("bbox")):
+        box=line["bbox"]; return box,"line_bbox_approximation",rectangle(box)
+    return None,"no_coordinates",[]
 
 def pad_bbox(b, size, pad=BOX_PADDING_PX):
     if not b:
@@ -910,7 +1095,7 @@ def build_detections(page, blocks, block_ents):
     for (frags, _), (block_id, x, _f) in sorted(best.items(), key=lambda kv: (kv[1][2][0][0], kv[1][2][0][1])):
         n += 1
         eid = f"{page['source_file']}-p{page['page']}-e{n}"
-        policy = POLITICA.get(x["category"], "no" if x["category"].startswith("ignorar") else "revisar")
+        policy = politica(x["category"], base=x["basis"], flags=x["flags"])
         for li, ls, le in frags:
             line = lines[li]
             bbox, precision, polygons = geometry_for_span(line, ls, le)
@@ -922,6 +1107,7 @@ def build_detections(page, blocks, block_ents):
                 "text": x["text"], "fragment_text": line["text"][ls:le],
                 "category": x["category"], "tarjar": policy, "score": x["score"],
                 "sources": x["sources"], "classification_basis": x["basis"], "flags": x["flags"],
+                "owner_name": x.get("owner"), "owner_role": x.get("owner_role"),
                 "ocr_confidence": line.get("ocr_confidence"),
                 "line_role": line.get("role"), "bbox_xyxy": bbox, "polygons": polygons,
                 "bbox_padded_xyxy": pad_bbox(bbox, size),
@@ -1065,7 +1251,7 @@ def analizar(texto, umbral_visual=0.30, usar_pipeline=True, propagar=True, mostr
         print("    Rojo = se tarja · naranja = revisar · gris = no se tarja / ignorado")
         marks, rows = [], []
         for x in ents:
-            pol = POLITICA.get(x["category"], "no" if x["category"].startswith("ignorar") else "revisar")
+            pol = politica(x["category"], base=x["basis"], flags=x["flags"])
             marks.append({"start": x["s"], "end": x["e"], "color": POLICY_BG.get(pol, "#e0e0e0"),
                           "tag": f"{x['category']} {x['score']:.2f}",
                           "tip": f"{x['category']} · {x['basis']} · fuentes {x['sources']} · flags {x['flags']}"})
@@ -1244,6 +1430,7 @@ def consolidar_repeticiones_seguras(detecciones):
                 continue
         elif familia == "telefono":
             k = re.sub(r"\D", "", valor)
+            if len(k)==11 and k.startswith("56"): k=k[2:]
             if len(k) < 8:
                 continue
         elif familia == "correo":
@@ -1286,6 +1473,68 @@ def consolidar_repeticiones_seguras(detecciones):
                 d["rule_ids"] = list(dict.fromkeys(aplicar(d).get("rule_ids", []) + ["RNA-12"]))
                 d["repetition_seed"] = semilla.get("entity_id")
 
+
+
+def consolidar_menores(detecciones):
+    """Repite solo nombre completo exacto de un menor sin rol contradictorio."""
+    groups={}
+    for d in detecciones:
+        if d['category'] not in {'persona','persona_revisar','persona_menor','persona_funcionario'}: continue
+        k=' '.join(fold(d['text']).split())
+        if len(k.split())<2: continue
+        groups.setdefault((d['source_file'],k),[]).append(d)
+    for group in groups.values():
+        seeds=[d for d in group if d['category']=='persona_menor' and d.get('classification_basis')=='menor_explicito' and d.get('tarjar')=='si']
+        if not seeds: continue
+        if any(d['category']=='persona_funcionario' for d in group):
+            for d in group:
+                d['classification_basis']='conflicto_contextual_documental'
+            continue
+        for d in group:
+            if d['category'] in {'persona','persona_revisar','persona_menor'} and d.get('classification_basis')!='menor_explicito':
+                d.update(category='persona_menor', classification_basis='repeticion_menor_confirmada', owner_role='menor', owner_name=seeds[0]['text'], repetition_seed=seeds[0].get('entity_id'))
+
+
+def resolver_conflictos_documento(detecciones):
+    """Elimina duplicados exactos y bloquea cualquier tarjado que choque con una protección explícita.
+    No usar etiquetas genéricas ignorar:lugar como prueba de que el dato sea público.
+    """
+    unique={}
+    for d in detecciones:
+        k=(d['source_file'],d['page'],d['line_index'],d['start'],d['end'],d['category'])
+        old=unique.get(k)
+        if old is None: unique[k]=d; continue
+        # Priorizar una evidencia contradictoria sobre una confirmación automática.
+        conflict=lambda x: x.get('classification_basis') in {'conflicto_contextual_documental','titularidad_contradictoria'} or 'conflicto_solapamiento' in x.get('flags',[])
+        rank=lambda x:(conflict(x),x.get('classification_basis')!='revisar_contexto_repeticion',bool(x.get('owner_name')),x.get('score',0))
+        if rank(d)>rank(old): unique[k]=d
+    vals=list(unique.values()); by_line={}
+    for d in vals: by_line.setdefault((d['source_file'],d['page'],d['line_index']),[]).append(d)
+    result=[]
+    for group in by_line.values():
+        kept=[]
+        for d in group:
+            generic=[x for x in group if x is not d and x['start']<=d['start'] and d['end']<=x['end'] and d['category'] in _SPECIFIC.get(x['category'],set()) and x['tarjar']!='revisar' and d.get('classification_basis')!='titularidad_contradictoria']
+            if generic:
+                for x in generic: x['flags'].append('hipotesis_generica_resuelta:'+d['category'])
+                continue
+            kept.append(d)
+        # Usar estado original para no dejar que el primer conflicto oculte los siguientes.
+        initial=[d['tarjar'] for d in kept]
+        for i,d in enumerate(kept):
+            if initial[i]!='si': continue
+            for j,other in enumerate(kept):
+                if i==j or not _ov(d['start'],d['end'],other['start'],other['end']): continue
+                explicit_public=initial[j]=='no' and not other['category'].startswith('ignorar:')
+                # Un dato definido como pendiente por RNA-13 no debe quedar cubierto por otra hipótesis.
+                pending=other['category']=='dato_pendiente' and other['start']<=d['start'] and d['end']<=other['end']
+                contradictory=other.get('classification_basis')=='titularidad_contradictoria'
+                if explicit_public or pending or contradictory:
+                    d['flags'].append('conflicto_solapamiento')
+                    d['flags'].append('solapa:'+other['category'])
+                    other['flags'].append('conflicto_solapamiento')
+        result.extend(aplicar(d) for d in kept)
+    return sorted(result,key=lambda d:(d['source_file'],d['page'],d['line_index'],d['start'],d['end'],d['category']))
 
 
 def clasificar_acto(paginas):
@@ -1406,8 +1655,10 @@ def procesar(entrada, salida=None, device="cpu", ner_es=False, modelo_ner_es=Non
                     ALL_DETECTIONS.append(d)
                     existing.add(key)
 
+    ALL_DETECTIONS = resolver_conflictos_documento(ALL_DETECTIONS)
     consolidar_repeticiones_seguras(ALL_DETECTIONS)
-    ALL_DETECTIONS = [aplicar(d) for d in ALL_DETECTIONS]
+    consolidar_menores(ALL_DETECTIONS)
+    ALL_DETECTIONS = resolver_conflictos_documento([aplicar(d) for d in ALL_DETECTIONS])
 
     DETECTIONS_OUTPUT = {
         "tipos_documento": tipos_documento,
